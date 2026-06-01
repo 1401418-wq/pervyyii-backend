@@ -110,7 +110,7 @@ tbody tr:hover { background: rgba(201,168,76,0.04); }
       <h1>Первый ИИ · витрина-агент</h1>
     </div>
     <div class="right">
-      <span id="tg-status">…</span>
+      <a href="#" id="tg-status" onclick="openSubs(event)" style="color:var(--gold); text-decoration:none; cursor:pointer;">…</a>
       <span id="last-refresh"></span>
     </div>
   </div>
@@ -162,6 +162,16 @@ tbody tr:hover { background: rgba(201,168,76,0.04); }
     </div>
     <div class="modal-meta" id="modal-meta"></div>
     <div class="modal-body" id="modal-body">загрузка…</div>
+  </div>
+</div>
+
+<div class="modal-bg" id="modal-subs-bg">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Подписчики Telegram</h2>
+      <button class="close" onclick="closeSubs()">×</button>
+    </div>
+    <div class="modal-body" id="modal-subs-body">загрузка…</div>
   </div>
 </div>
 
@@ -293,7 +303,63 @@ function closeModal() { document.getElementById('modal-bg').classList.remove('op
 document.getElementById('modal-bg').addEventListener('click', e => {
   if (e.target.id === 'modal-bg') closeModal();
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+function openSubs(e) {
+  if (e) e.preventDefault();
+  document.getElementById('modal-subs-bg').classList.add('open');
+  renderSubs();
+}
+function closeSubs() { document.getElementById('modal-subs-bg').classList.remove('open'); }
+document.getElementById('modal-subs-bg').addEventListener('click', e => {
+  if (e.target.id === 'modal-subs-bg') closeSubs();
+});
+
+function renderSubs() {
+  const subs = DATA.subscribers || [];
+  const body = document.getElementById('modal-subs-body');
+  if (subs.length === 0) {
+    body.innerHTML = '<div class="empty">пока никто не подписан</div>';
+    return;
+  }
+  body.innerHTML = `
+    <table style="border:none;">
+      <thead><tr><th>Имя</th><th>Username</th><th>Когда</th><th></th></tr></thead>
+      <tbody>
+        ${subs.map(s => `
+          <tr>
+            <td>${escapeHtml(s.first_name || '—')}</td>
+            <td><span class="mono">${s.username ? '@' + escapeHtml(s.username) : '—'}</span></td>
+            <td><span class="mono">${escapeHtml(fmtDate(s.subscribed_at))}</span></td>
+            <td style="text-align:right;">
+              <button class="filter" style="color:var(--red); border-color:rgba(194,90,78,0.3);"
+                onclick="unsubscribe('${escapeHtml(s.chat_id)}', '${escapeHtml(s.first_name || s.username || s.chat_id)}')">
+                отписать
+              </button>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+async function unsubscribe(chatId, label) {
+  if (!confirm('Отписать ' + label + '?')) return;
+  try {
+    const res = await fetch('/admin/subscriber/' + encodeURIComponent(chatId), {
+      method: 'DELETE', credentials: 'include',
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await load();
+    renderSubs();
+  } catch (e) {
+    alert('Не удалось: ' + e.message);
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeModal(); closeSubs(); }
+});
 
 ['search','f-niche','f-lead'].forEach(id => {
   document.getElementById(id).addEventListener('input', render);

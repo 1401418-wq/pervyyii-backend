@@ -475,7 +475,9 @@ async def admin_data(request: Request):
                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS week
                FROM sessions"""
         )
-        sub_count = await conn.fetchval("SELECT COUNT(*) FROM telegram_subscribers")
+        subs = await conn.fetch(
+            "SELECT chat_id, username, first_name, subscribed_at FROM telegram_subscribers ORDER BY subscribed_at DESC"
+        )
     return {
         "stats": dict(stats) if stats else {},
         "sessions": [
@@ -486,8 +488,27 @@ async def admin_data(request: Request):
             }
             for s in sessions
         ],
-        "telegram_subscribers": sub_count,
+        "telegram_subscribers": len(subs),
+        "subscribers": [
+            {
+                "chat_id": str(s["chat_id"]),
+                "username": s["username"],
+                "first_name": s["first_name"],
+                "subscribed_at": s["subscribed_at"].isoformat() if s["subscribed_at"] else None,
+            }
+            for s in subs
+        ],
     }
+
+
+@app.delete("/admin/subscriber/{chat_id}")
+async def admin_unsubscribe(chat_id: int, request: Request):
+    require_admin(request)
+    if not pool:
+        return JSONResponse({"error": "database not configured"}, status_code=503)
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM telegram_subscribers WHERE chat_id=$1", chat_id)
+    return {"ok": True, "deleted": result.split()[-1] if result else "0"}
 
 
 @app.get("/admin/session/{session_id}")
