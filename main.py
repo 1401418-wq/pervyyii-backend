@@ -24,6 +24,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+TELEGRAM_SUBSCRIBE_CODE = os.environ.get("TELEGRAM_SUBSCRIBE_CODE", "")
 
 SYSTEM = """Ты — AI-консультант на сайте компании «Первый ИИ» (pervyyii.ru).
 Компания создаёт и внедряет AI-агентов для российского бизнеса.
@@ -193,6 +194,12 @@ async def telegram_webhook(secret: str, request: Request):
     if not chat_id:
         return {"ok": True}
     if text.startswith("/start"):
+        # Require correct subscription code; silently ignore otherwise so
+        # the bot doesn't reveal itself to random visitors.
+        parts = text.split(maxsplit=1)
+        code = parts[1].strip() if len(parts) > 1 else ""
+        if not TELEGRAM_SUBSCRIBE_CODE or not secrets.compare_digest(code, TELEGRAM_SUBSCRIBE_CODE):
+            return {"ok": True}
         try:
             async with pool.acquire() as conn:
                 await conn.execute(
