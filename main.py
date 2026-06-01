@@ -102,7 +102,13 @@ async def chat(request: Request):
                 json={
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 2000,
-                    "system": SYSTEM,
+                    "system": [
+                        {
+                            "type": "text",
+                            "text": SYSTEM,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
                     "messages": messages,
                 },
             )
@@ -121,7 +127,7 @@ async def chat(request: Request):
             {"error": "empty reply from model", "raw": data},
             status_code=502,
         )
-    return JSONResponse({"reply": reply})
+    return JSONResponse({"reply": reply, "usage": data.get("usage")})
 
 
 @app.get("/")
