@@ -507,6 +507,21 @@ async def root():
     return {"status": "ok", "service": "Pervyyii AI Agent"}
 
 
+@app.get("/debug/env-check")
+async def env_check():
+    def mask(v: str) -> dict:
+        return {"present": bool(v), "len": len(v) if v else 0,
+                "preview": (v[:3] + "…" + v[-3:]) if v and len(v) > 8 else ("set" if v else "")}
+    return {
+        "ANTHROPIC_API_KEY": mask(ANTHROPIC_API_KEY),
+        "DATABASE_URL": mask(DATABASE_URL),
+        "ADMIN_PASSWORD": mask(ADMIN_PASSWORD),
+        "TELEGRAM_BOT_TOKEN": mask(TELEGRAM_BOT_TOKEN),
+        "TELEGRAM_WEBHOOK_SECRET": mask(TELEGRAM_WEBHOOK_SECRET),
+        "pool_ready": pool is not None,
+    }
+
+
 @app.get("/agent.html")
 async def agent_page():
     return FileResponse("agent.html")
