@@ -25,6 +25,7 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 TELEGRAM_SUBSCRIBE_CODE = os.environ.get("TELEGRAM_SUBSCRIBE_CODE", "")
+BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET", "")
 
 SYSTEM = """Ты — AI-консультант на сайте компании «Первый ИИ» (pervyyii.ru).
 Компания создаёт и внедряет AI-агентов для российского бизнеса.
@@ -529,6 +530,32 @@ async def admin_session_detail(session_id: str, request: Request):
 
 
 # ─────────────────── Public ───────────────────
+
+@app.post("/broadcast")
+async def broadcast(request: Request):
+    """Receive a lead notification from another family backend and fan out via Telegram.
+    Auth: X-Broadcast-Secret header matching BROADCAST_SECRET env."""
+    if not BROADCAST_SECRET:
+        raise HTTPException(503, "broadcast not configured")
+    if not secrets.compare_digest(request.headers.get("x-broadcast-secret", ""), BROADCAST_SECRET):
+        raise HTTPException(401, "bad secret")
+    payload = await request.json()
+    source = payload.get("source") or "—"
+    name = payload.get("name") or "—"
+    contact = payload.get("contact") or "—"
+    niche = payload.get("niche") or "—"
+    tariff = payload.get("tariff") or "—"
+    summary = payload.get("summary") or ""
+    await tg_send(
+        f"🎯 <b>Новая заявка с {source}</b>\n\n"
+        f"<b>Имя:</b> {name}\n"
+        f"<b>Контакт:</b> {contact}\n"
+        f"<b>Кто/Сфера:</b> {niche}\n"
+        f"<b>Интерес:</b> {tariff}\n\n"
+        f"<i>{summary}</i>"
+    )
+    return {"ok": True}
+
 
 @app.get("/")
 async def root():
