@@ -518,17 +518,6 @@ async def admin_unsubscribe(chat_id: int, request: Request):
     return {"ok": True, "deleted": result.split()[-1] if result else "0"}
 
 
-# TEMP: cleanup test sessions (prefix-scoped, safe to expose briefly)
-@app.post("/admin/_cleanup_test")
-async def cleanup_test_sessions():
-    if not pool:
-        return JSONResponse({"error": "database not configured"}, status_code=503)
-    async with pool.acquire() as conn:
-        msgs = await conn.execute("DELETE FROM messages WHERE session_id LIKE 'test-%'")
-        sess = await conn.execute("DELETE FROM sessions WHERE session_id LIKE 'test-%'")
-    return {"ok": True, "messages_deleted": msgs, "sessions_deleted": sess}
-
-
 @app.get("/admin/session/{session_id}")
 async def admin_session_detail(session_id: str, request: Request):
     require_admin(request)
