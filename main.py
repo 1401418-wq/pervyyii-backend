@@ -568,6 +568,11 @@ async def root():
     return {"status": "ok", "service": "Pervyyii AI Agent"}
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "db": "up" if pool else "down"}
+
+
 @app.get("/agent.html")
 async def agent_page():
     return FileResponse("agent.html")
