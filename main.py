@@ -26,6 +26,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 TELEGRAM_SUBSCRIBE_CODE = os.environ.get("TELEGRAM_SUBSCRIBE_CODE", "")
 BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET", "")
+DEMO_BOT_TOKEN = os.environ.get("DEMO_BOT_TOKEN", "")
+DEMO_WEBHOOK_SECRET = os.environ.get("DEMO_WEBHOOK_SECRET", "")
 
 SYSTEM = """Ты — AI-консультант на сайте компании «Первый ИИ» (pervyyii.ru).
 Компания создаёт и внедряет AI-агентов для российского бизнеса.
@@ -93,6 +95,88 @@ SYSTEM = """Ты — AI-консультант на сайте компании 
   а не «интересованные»; «принять решение», а не «решиться принять».
 - Если выделяешь термин или цифру — используй markdown **жирным**. Списки —
   обычными тире. Не злоупотребляй выделениями, максимум 2-3 на сообщение."""
+
+
+# ─────────────────── Demo bot (public Telegram) ───────────────────
+
+DEMO_GREETING = (
+    "Здравствуйте! Я — живая демонстрация AI-агента, которого делает компания "
+    "«Первый ИИ» (pervyyii.ru).\n\n"
+    "Назовите *вашу нишу одним сообщением* — и через несколько секунд я покажу "
+    "3 диалога, как такой агент будет разговаривать с *вашими* клиентами.\n\n"
+    "Примеры, что написать:\n"
+    "— автосервис в Краснодаре, шиномонтаж\n"
+    "— салон красоты, маникюр и брови\n"
+    "— стоматология, виниры и имплантация\n"
+    "— детский центр развития 3–7 лет\n\n"
+    "Жду вашу нишу 👇"
+)
+
+DEMO_SYSTEM = """Ты — Telegram-бот @pervyyii_demo_bot. Живая демонстрация AI-агентов компании «Первый ИИ» (pervyyii.ru), которая делает AI-агентов для российского бизнеса.
+
+# ГЛАВНАЯ ЗАДАЧА
+Когда человек называет свою нишу — покажи живое демо: сгенерируй 3 короткие сценки-диалога, как агент, сделанный под его бизнес, говорил бы с его реальными клиентами. Цель — чтобы человек увидел готовый продукт под себя, а не слушал абстрактные обещания.
+
+# ФОРМАТ ПЕРВОГО ДЕМО
+После первого осмысленного сообщения с нишей бизнеса отвечаешь строго так:
+
+«Готовый агент для [ниша] говорил бы вашим клиентам так:
+
+━━━━━━━━━━━━━━━━━
+*Сцена 1. [короткое название — типичный запрос]*
+
+— [реплика клиента, естественная, по-человечески]
+— [реплика агента: коротко, на «вы», по делу]
+— [клиент уточняет / возражает]
+— [агент решает: записывает, считает, переводит на мастера]
+
+━━━━━━━━━━━━━━━━
+*Сцена 2. [возражение про цену или сомнение]*
+…
+
+━━━━━━━━━━━━━━━━
+*Сцена 3. [ночное обращение или сложный запрос — то, что человек руками не успевает]*
+…
+━━━━━━━━━━━━━━━━
+
+Понравилось? Если хотите такого же — оставьте имя и телефон или Telegram. Соберу под вас за 3 дня.»
+
+# ПРАВИЛА ДЕМО-СЦЕН
+- Сцены ДОЛЖНЫ быть конкретными под нишу: реальные названия услуг, типичные возражения, реалистичные вилки цен (пиши «от X ₽» или «обычно Y», не выдумывай точные цифры).
+- Агент в сценах общается как живой человек: коротко, на «вы», без канцелярита и роботизмов.
+- Третья сцена показывает «то, что руками невозможно»: ночное обращение, два клиента одновременно, сложный возврат, забытая запись.
+- Каждая сцена — 4-6 реплик, не больше. Не растягивай.
+- Не используй имена клиентов в сценах («— Здравствуйте, я Иван...»). Только содержательные реплики.
+
+# ПОСЛЕ ДЕМО
+Если человек оставил имя и контакт (телефон или Telegram-юзернейм):
+→ Поблагодари тепло и коротко: «Спасибо, [имя]! Получил заявку. Свяжусь с вами в течение 2 часов лично.» Больше ничего не пиши, не предлагай ещё демо.
+
+Если человек задаёт вопросы про услугу — отвечай как консультант, коротко (2-4 предложения):
+- Внедрение под ключ за 3-7 дней.
+- Тарифы: Старт 29 000 ₽ + 4 900 ₽/мес, Про 49 000 ₽ + 7 900 ₽/мес, Премиум 89 000 ₽ + 17 900 ₽/мес, Индивидуальный от 150 000 ₽.
+- Виджет ставится на сайт за 5 минут (Tilda, Bitrix24, WordPress, любой конструктор).
+- Мультиканальность (Telegram, WhatsApp) — Премиум и Индивидуальный.
+- CRM-интеграция (Битрикс24, AmoCRM) — Премиум и выше.
+- Ежемесячная доработка по реальным диалогам входит во все тарифы.
+
+Если человек хочет демо для ДРУГОЙ ниши — сделай новое полноценное демо в том же формате.
+
+Если человек пишет что-то непонятное (одно слово, эмодзи, бессмыслицу) — мягко переспроси: «Расскажите коротко о вашем бизнесе — какая ниша, что продаёте? Тогда покажу демо.»
+
+# ЯЗЫК И СТИЛЬ
+- Только русский, без англицизмов где есть нормальные русские слова.
+- Эмодзи — крайне сдержанно, максимум один на сообщение.
+- Telegram Markdown: *жирный* (одна звёздочка, не две), _курсив_, `код`. Списки — обычными тире.
+- Не используй ## заголовки, **двойные звёздочки**, --- горизонтальные линии — Telegram их не рендерит как markdown. Только то, что выше.
+
+# ЧЕГО НЕ ДЕЛАТЬ
+- Не давай скидок и не торгуйся.
+- Не обещай сроки конкретнее «3-7 дней».
+- Не упоминай слова «промпт», «API», «GPT», «Claude», «нейросеть», «искусственный интеллект» в долгих рассуждениях. Ты просто умный агент.
+- Не задавай больше 1 вопроса в сообщении.
+- Не пиши длинные послесловия после демо — после трёх сцен только короткий призыв оставить контакт.
+- Не обсуждай темы вне работы компании."""
 
 
 SCHEMA_SQL = """
@@ -242,6 +326,194 @@ async def _tg_send_to(chat_id: int, text: str) -> None:
         print(f"[tg] direct send failed: {e}")
 
 
+# ─────────────────── Demo bot (public) ───────────────────
+
+async def demo_send(chat_id: int, text: str, parse_mode: str | None = "Markdown") -> None:
+    """Send a message via the public demo bot. Falls back to plain text if markdown breaks."""
+    if not DEMO_BOT_TOKEN:
+        return
+    payload = {"chat_id": chat_id, "text": text[:4000]}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{DEMO_BOT_TOKEN}/sendMessage",
+                json=payload,
+            )
+            if r.status_code >= 400 and parse_mode:
+                # markdown parsing likely failed — retry as plain text
+                payload.pop("parse_mode", None)
+                await client.post(
+                    f"https://api.telegram.org/bot{DEMO_BOT_TOKEN}/sendMessage",
+                    json=payload,
+                )
+    except Exception as e:
+        print(f"[demo] send failed: {e}")
+
+
+async def demo_typing(chat_id: int) -> None:
+    if not DEMO_BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{DEMO_BOT_TOKEN}/sendChatAction",
+                json={"chat_id": chat_id, "action": "typing"},
+            )
+    except Exception:
+        pass
+
+
+@app.post("/demo/webhook/{secret}")
+async def demo_webhook(secret: str, request: Request):
+    if not DEMO_WEBHOOK_SECRET or not secrets.compare_digest(secret, DEMO_WEBHOOK_SECRET):
+        raise HTTPException(404)
+    if not (DEMO_BOT_TOKEN and ANTHROPIC_API_KEY):
+        return {"ok": True}
+
+    update = await request.json()
+    msg = update.get("message") or update.get("edited_message") or {}
+    text = (msg.get("text") or "").strip()
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return {"ok": True}
+
+    # Ignore non-text (stickers, photos, voice) with a gentle nudge
+    if not text:
+        await demo_send(chat_id, "Я понимаю только текст. Напишите вашу нишу одним сообщением — покажу демо.")
+        return {"ok": True}
+
+    # Cap incoming length defensively
+    text = text[:2000]
+    session_id = f"tg_demo_{chat_id}"
+    username = chat.get("username") or ""
+    first_name = chat.get("first_name") or ""
+    user_label = f"@{username}" if username else first_name or str(chat_id)
+
+    # /start — reset session and greet
+    if text == "/start" or text.startswith("/start "):
+        if pool:
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute("DELETE FROM messages WHERE session_id=$1", session_id)
+                    await conn.execute(
+                        """INSERT INTO sessions (session_id, user_agent, referrer, ip)
+                           VALUES ($1, 'telegram', $2, '')
+                           ON CONFLICT (session_id) DO UPDATE
+                           SET last_activity_at=NOW(),
+                               has_lead=FALSE, lead_notified=FALSE,
+                               msg_count=0, referrer=EXCLUDED.referrer""",
+                        session_id, f"@pervyyii_demo_bot ← {user_label}",
+                    )
+            except Exception as e:
+                print(f"[demo] /start db reset failed: {e}")
+        await demo_send(chat_id, DEMO_GREETING)
+        return {"ok": True}
+
+    # /help — short instructions
+    if text == "/help":
+        await demo_send(
+            chat_id,
+            "Просто напишите вашу нишу одним сообщением — например *«автосервис»* или "
+            "*«репетитор по математике»* — и я покажу 3 диалога, как агент будет говорить "
+            "с вашими клиентами.\n\nКоманды:\n/start — начать заново\n/help — эта подсказка",
+        )
+        return {"ok": True}
+
+    # Regular conversational turn
+    if not pool:
+        await demo_send(chat_id, "Сервис временно недоступен. Попробуйте позже.")
+        return {"ok": True}
+
+    try:
+        async with pool.acquire() as conn:
+            history = await conn.fetch(
+                "SELECT role, content FROM messages WHERE session_id=$1 ORDER BY created_at LIMIT 40",
+                session_id,
+            )
+            await conn.execute(
+                """INSERT INTO sessions (session_id, user_agent, referrer, ip)
+                   VALUES ($1, 'telegram', $2, '')
+                   ON CONFLICT (session_id) DO UPDATE SET last_activity_at=NOW()""",
+                session_id, f"@pervyyii_demo_bot ← {user_label}",
+            )
+            await conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES ($1, 'user', $2)",
+                session_id, text[:8000],
+            )
+    except Exception as e:
+        print(f"[demo] db pre-call failed: {e}")
+        history = []
+
+    await demo_typing(chat_id)
+
+    messages_for_claude = [{"role": r["role"], "content": r["content"]} for r in history]
+    messages_for_claude.append({"role": "user", "content": text})
+
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 1500,
+                    "system": [
+                        {
+                            "type": "text",
+                            "text": DEMO_SYSTEM,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                    "messages": messages_for_claude,
+                },
+            )
+            data = response.json()
+    except httpx.HTTPError as e:
+        print(f"[demo] upstream failed: {e}")
+        await demo_send(chat_id, "Связь с моделью прервалась. Попробуйте отправить ещё раз через минуту.")
+        return {"ok": True}
+
+    if "error" in data:
+        print(f"[demo] anthropic error: {data['error']}")
+        await demo_send(chat_id, "Что-то пошло не так на моей стороне. Попробуйте ещё раз через минуту.")
+        return {"ok": True}
+
+    content = data.get("content") or []
+    reply = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
+    if not reply:
+        await demo_send(chat_id, "Не получилось сгенерировать ответ. Попробуйте переформулировать.")
+        return {"ok": True}
+
+    usage = data.get("usage") or {}
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO messages
+                    (session_id, role, content, input_tokens, output_tokens, cache_read)
+                   VALUES ($1, 'assistant', $2, $3, $4, $5)""",
+                session_id, reply[:8000],
+                usage.get("input_tokens"), usage.get("output_tokens"),
+                usage.get("cache_read_input_tokens"),
+            )
+            await conn.execute(
+                "UPDATE sessions SET msg_count = msg_count + 2, last_activity_at = NOW() WHERE session_id=$1",
+                session_id,
+            )
+        asyncio.create_task(extract_metadata(session_id, source="Telegram-демо-бота"))
+    except Exception as e:
+        print(f"[demo] db post-call failed: {e}")
+
+    await demo_send(chat_id, reply)
+    return {"ok": True}
+
+
 # ─────────────────── Metadata extraction ───────────────────
 
 EXTRACTION_SYSTEM = """Ты обрабатываешь диалог посетителя сайта с AI-агентом, который продаёт услугу AI-агентов для бизнеса.
@@ -258,9 +530,9 @@ EXTRACTION_SYSTEM = """Ты обрабатываешь диалог посети
 }"""
 
 
-async def extract_metadata(session_id: str) -> None:
+async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None:
     """Background: read transcript, ask LLM for structured fields, update sessions row.
-    Also fires Telegram notification on first lead detection."""
+    Also fires Telegram notification on first lead detection. `source` is shown in the TG message."""
     if not (pool and ANTHROPIC_API_KEY):
         return
     try:
@@ -320,7 +592,7 @@ async def extract_metadata(session_id: str) -> None:
             tariff = extracted.get("tariff_interest") or "—"
             summary = extracted.get("intent_summary") or ""
             await tg_send(
-                f"🎯 <b>Новый лид с pervyyii.ru</b>\n\n"
+                f"🎯 <b>Новый лид с {source}</b>\n\n"
                 f"<b>Имя:</b> {name}\n"
                 f"<b>Контакт:</b> {contact}\n"
                 f"<b>Сфера:</b> {niche}\n"
