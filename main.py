@@ -1046,8 +1046,12 @@ async def audit(request: Request):
             jina_headers = {"Accept": "text/plain", "X-Return-Format": "text"}
             jina_key = os.environ.get("JINA_API_KEY", "")
             if jina_key:
+                # С ключом включаем полноценный браузерный рендер для SPA
                 jina_headers["Authorization"] = f"Bearer {jina_key}"
-            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                jina_headers["X-Engine"] = "browser"
+                jina_headers["X-Timeout"] = "30"
+                jina_headers["X-No-Cache"] = "true"
+            async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
                 jina = await client.get(f"https://r.jina.ai/{site_url}", headers=jina_headers)
                 jina_status = f"http_{jina.status_code}_len_{len(jina.text or '')}"
                 # Меньше 500 символов = заглушка/ошибка/баннер, не реальный контент
