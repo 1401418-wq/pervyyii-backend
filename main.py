@@ -1162,7 +1162,15 @@ async def audit(request: Request):
             break
 
     if not result or not isinstance(result.get("problems"), list) or not result["problems"]:
+        print(f"[AUDIT] FAIL url={url} ip={ip} reason=bad_json site_ok={site_ok} jina={jina_status}", flush=True)
         return JSONResponse({"error": "Не удалось разобрать ответ модели — попробуйте ещё раз"}, status_code=502)
+
+    titles = " | ".join((p.get("title") or "").strip() for p in result["problems"][:5])
+    print(
+        f"[AUDIT] OK url={url} ip={ip} site_ok={site_ok} jina={jina_status} "
+        f"summary={(result.get('summary') or '').strip()[:200]} titles={titles[:400]}",
+        flush=True,
+    )
 
     return JSONResponse({
         "url": url,
