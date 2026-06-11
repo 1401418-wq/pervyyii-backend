@@ -1043,16 +1043,25 @@ async def audit(request: Request):
     jina_status = "skipped"
     if not site_ok or len(parsed["body_text"]) < 500:
         try:
+            jina_headers = {"Accept": "text/plain", "X-Return-Format": "text"}
+            jina_key = os.environ.get("JINA_API_KEY", "")
+            if jina_key:
+                jina_headers["Authorization"] = f"Bearer {jina_key}"
             async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-                jina = await client.get(
-                    f"https://r.jina.ai/{site_url}",
-                    headers={"Accept": "text/plain", "X-Return-Format": "text"},
-                )
+                jina = await client.get(f"https://r.jina.ai/{site_url}", headers=jina_headers)
                 jina_status = f"http_{jina.status_code}_len_{len(jina.text or '')}"
-                if jina.status_code < 400 and jina.text:
+                # Меньше 500 символов = заглушка/ошибка/баннер, не реальный контент
+                if jina.status_code < 400 and jina.text and len(jina.text) >= 500:
                     jina_text = jina.text[:8000]
         except httpx.HTTPError as e:
             jina_status = f"error_{type(e).__name__}"
+
+    # Если сайт SPA (HTML пустой) и Jina не помогла — честно говорим, не врём
+    if site_ok and len(parsed["body_text"]) < 500 and not jina_text:
+        return JSONResponse(
+            {"error": "Сайт построен на технологии, которую анализатор пока не разбирает (React/Vue/Next без серверного рендера). Попробуйте позже — мы работаем над этим."},
+            status_code=422,
+        )
 
     if not site_ok and not jina_text:
         return JSONResponse(
