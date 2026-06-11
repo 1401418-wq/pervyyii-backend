@@ -3,12 +3,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import httpx
 import os
+import re
 import json
 import uuid
 import base64
 import secrets
 import asyncio
 import asyncpg
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 app = FastAPI()
 
@@ -850,6 +853,303 @@ async def broadcast(request: Request):
         f"<i>{summary}</i>"
     )
     return {"ok": True}
+
+
+# ─────────────────── Audit (lead-magnet) ───────────────────
+
+AUDIT_SYSTEM = """Ты — старший консультант агентства «Первый ИИ» (pervyyii.ru),
+которое делает AI-агентов для российского малого и среднего бизнеса.
+Тебе дают текст и метаданные конкретного сайта. Твоя задача — найти
+ровно 5 КОНКРЕТНЫХ проблем, которые мешают этому сайту приносить
+больше заявок. Не общие фразы про «современный дизайн» — а наблюдения
+с цитатами и числами из самого сайта.
+
+# КАК ДУМАТЬ
+- Смотри глазами посетителя малого бизнеса в РФ. Что мешает оставить
+  заявку прямо сейчас.
+- Каждая проблема — либо про доверие, либо про скорость отклика, либо
+  про прозрачность (цены, сроки, кейсы), либо про вопросы без ответа,
+  либо про неудобство первого шага.
+- Один из 5 пунктов обязательно — про то, что у сайта нет AI-агента /
+  онлайн-консультанта, который отвечает 24/7. Это наш продукт.
+
+# ЧТО УМЕЕТ ПРОДУКТ «ПЕРВЫЙ ИИ» (упоминай только это в fix)
+- AI-агент в виде чата на сайте: отвечает текстом 24/7, знает услуги,
+  цены, сроки, отвечает на вопросы, собирает контакт и передаёт лид
+  в Telegram владельца.
+- Может работать так же в Telegram и WhatsApp (отдельная опция).
+- НЕ умеет: общаться голосом, звонить, делать дизайн, делать видео.
+  Не выдумывай функционал.
+
+# ВАЖНОЕ ОГРАНИЧЕНИЕ
+Ты видишь только текст со страницы. JavaScript-виджеты (плавающие чаты,
+кнопки мессенджеров, всплывающие формы) могут быть на сайте, но в текст
+не попадают. Поэтому:
+- НИКОГДА не утверждай «на сайте нет чата / нет онлайн-консультанта /
+  нет агента». Ты этого не можешь знать.
+- Если хочешь поднять тему AI-агента 24/7 — формулируй её через
+  УЛУЧШЕНИЕ: «если у вас уже стоит чат, убедитесь что он отвечает
+  моментально и знает все услуги; если нет — поставьте». Без обвинения.
+- НИКОГДА не утверждай «нет формы заявки», «нет телефона» и т.п., если
+  в данных про каналы связи это не подтверждено явно.
+
+# ЧЕГО НЕЛЬЗЯ ДЕЛАТЬ
+- НЕ выдумывай статистику и проценты. Не пиши «60-70% заявок теряется»,
+  «X% посетителей уходят» — у тебя нет этих данных. Говори качественно:
+  «много обращений ночью», «значительная часть аудитории», без цифр.
+- НЕ ссылайся на служебные поля из входных данных («поле X: False»).
+  Эти флаги — для твоей ориентации, не упоминай их в evidence.
+- НЕ выдумывай детали сайта, которых нет в тексте, который тебе дали.
+  Если каких-то данных нет — так и пиши: «на главной нет упоминания…».
+- НЕ называй конкретных конкурентов и брендов.
+
+# ФОРМАТ ОТВЕТА
+Строго JSON, без префиксов и пояснений, по схеме:
+{
+  "summary": "одно предложение про сайт в целом — что заметно сразу",
+  "problems": [
+    {
+      "title": "короткий заголовок проблемы (до 60 символов)",
+      "evidence": "что именно я увидел на сайте — цитата или факт со страницы",
+      "impact": "как это бьёт по выручке/заявкам — качественно, без выдуманных цифр",
+      "fix": "что предлагает Первый ИИ — особенно как агент это закрывает"
+    }
+  ]
+}
+
+Ровно 5 объектов в problems. На русском. Без эмодзи. Без markdown.
+
+# ПРАВИЛО КАВЫЧЕК
+В значениях полей (evidence, impact, fix, summary, title) используй
+только русские кавычки: «ёлочки» для основной речи и „лапки" — для
+цитат внутри цитат. Прямую двойную кавычку " не используй внутри
+значений никогда — она ломает JSON. Если на сайте было " — заменяй
+на «».
+"""
+
+
+def _clean_html_to_text(html: str, limit: int = 8000) -> dict:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
+        tag.decompose()
+
+    title = (soup.title.string or "").strip() if soup.title else ""
+    meta_desc = ""
+    md = soup.find("meta", attrs={"name": "description"})
+    if md and md.get("content"):
+        meta_desc = md["content"].strip()
+
+    h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")][:5]
+    h2s = [h.get_text(" ", strip=True) for h in soup.find_all("h2")][:10]
+
+    has_form = bool(soup.find("form"))
+    has_phone = bool(re.search(r"(\+7|8\s?\(?9\d{2}|tel:)", html))
+    has_email = bool(re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", html))
+    has_whatsapp = "wa.me" in html or "whatsapp" in html.lower()
+    has_telegram = "t.me/" in html or "telegram" in html.lower()
+    has_chat_widget = any(s in html.lower() for s in ["jivo", "talk-me", "carrotquest", "verbox", "intercom"])
+
+    body_text = soup.get_text(" ", strip=True)
+    body_text = re.sub(r"\s+", " ", body_text)
+    if len(body_text) > limit:
+        body_text = body_text[:limit] + " […обрезано]"
+
+    return {
+        "title": title,
+        "meta_desc": meta_desc,
+        "h1s": h1s,
+        "h2s": h2s,
+        "has_form": has_form,
+        "has_phone": has_phone,
+        "has_email": has_email,
+        "has_whatsapp": has_whatsapp,
+        "has_telegram": has_telegram,
+        "has_chat_widget": has_chat_widget,
+        "body_text": body_text,
+    }
+
+
+def _normalize_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if not re.match(r"^https?://", raw, re.I):
+        raw = "https://" + raw
+    p = urlparse(raw)
+    if not p.netloc or "." not in p.netloc:
+        return ""
+    return raw
+
+
+_audit_rate: dict[str, list[float]] = {}
+
+
+def _rate_limited(ip: str, limit: int = 5, window: int = 3600) -> bool:
+    import time
+    now = time.time()
+    bucket = [t for t in _audit_rate.get(ip, []) if now - t < window]
+    if len(bucket) >= limit:
+        _audit_rate[ip] = bucket
+        return True
+    bucket.append(now)
+    _audit_rate[ip] = bucket
+    return False
+
+
+@app.post("/audit")
+async def audit(request: Request):
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse({"error": "ANTHROPIC_API_KEY is not configured"}, status_code=500)
+
+    body = await request.json()
+    url = _normalize_url(body.get("url", ""))
+    if not url:
+        return JSONResponse({"error": "Укажите корректный адрес сайта"}, status_code=400)
+
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "").split(",")[0].strip() or "unknown"
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown") and _rate_limited(ip):
+        return JSONResponse({"error": "Слишком много запросов. Попробуйте через час."}, status_code=429)
+
+    ua_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+
+    # Пробуем https → https без verify → http (на случай сломанной HTTPS-конфигурации)
+    candidates = [(url, True), (url, False)]
+    if url.startswith("https://"):
+        candidates.append((url.replace("https://", "http://", 1), True))
+
+    site_html = ""
+    site_url = url
+    site_ok = False
+    for candidate_url, verify in candidates:
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True, verify=verify) as client:
+                resp = await client.get(candidate_url, headers=ua_headers)
+            if resp.status_code < 400:
+                site_html = resp.text
+                site_url = str(resp.url)
+                site_ok = True
+                break
+        except httpx.HTTPError:
+            continue
+
+    parsed = _clean_html_to_text(site_html) if site_html else _clean_html_to_text("<html></html>")
+
+    # Fallback на Jina Reader: либо нам отказали, либо это SPA с пустым HTML.
+    # Передаём в Jina тот URL, который реально открылся (или исходный, если ничего не вышло).
+    jina_text = ""
+    if not site_ok or len(parsed["body_text"]) < 500:
+        try:
+            async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
+                jina = await client.get(
+                    f"https://r.jina.ai/{site_url}",
+                    headers={"Accept": "text/plain", "X-Return-Format": "text"},
+                )
+                if jina.status_code < 400 and jina.text:
+                    jina_text = jina.text[:8000]
+        except httpx.HTTPError:
+            pass
+
+    if not site_ok and not jina_text:
+        return JSONResponse(
+            {"error": "Не получилось открыть сайт. Проверьте адрес и доступность."},
+            status_code=502,
+        )
+
+    if jina_text:
+        body_for_prompt = jina_text
+        flag_source = jina_text
+        source_note = "Источник: текст со страницы (рендер SPA через внешний reader)"
+    else:
+        body_for_prompt = parsed["body_text"] or "(текст не извлечён)"
+        flag_source = site_html
+        source_note = "Источник: HTML страницы"
+
+    has_phone = bool(re.search(r"(\+7|8[\s\-]?\(?9\d{2}|tel:)", flag_source))
+    has_email = bool(re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", flag_source))
+    has_whatsapp = "wa.me" in flag_source.lower() or "whatsapp" in flag_source.lower()
+    has_telegram = "t.me/" in flag_source.lower() or "telegram" in flag_source.lower()
+
+    channels = []
+    if parsed["has_form"]: channels.append("форма заявки")
+    if has_phone: channels.append("телефон")
+    if has_email: channels.append("email")
+    if has_whatsapp: channels.append("WhatsApp")
+    if has_telegram: channels.append("Telegram")
+    if parsed["has_chat_widget"]: channels.append("сторонний чат-виджет")
+    channels_line = ", ".join(channels) if channels else "ничего из этого не найдено"
+
+    user_message = (
+        f"URL: {url}\n"
+        f"Title: {parsed['title']}\n"
+        f"Meta description: {parsed['meta_desc']}\n"
+        f"H1: {' | '.join(parsed['h1s']) or '(нет)'}\n"
+        f"H2: {' | '.join(parsed['h2s']) or '(нет)'}\n"
+        f"Каналы связи на странице: {channels_line}.\n\n"
+        f"{source_note}:\n{body_for_prompt}"
+    )
+
+    async def call_model(extra_hint: str = "") -> tuple[dict | None, dict, int]:
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 2500,
+                        "system": AUDIT_SYSTEM,
+                        "messages": [
+                            {"role": "user", "content": user_message + extra_hint},
+                        ],
+                    },
+                )
+                return response.json(), {}, response.status_code
+        except httpx.HTTPError as e:
+            return None, {"error": f"upstream failed: {e}"}, 502
+
+    def extract_json(text: str) -> dict | None:
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
+        i, j = raw.find("{"), raw.rfind("}")
+        if i < 0 or j < i:
+            return None
+        chunk = raw[i:j+1]
+        for variant in (chunk, re.sub(r",(\s*[}\]])", r"\1", chunk)):
+            try:
+                return json.loads(variant)
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    result = None
+    last_data = None
+    for attempt in range(2):
+        hint = (
+            "\n\nВЕРНИ СТРОГО ОДИН JSON-ОБЪЕКТ, БЕЗ ТЕКСТА ДО ИЛИ ПОСЛЕ. "
+            "В значениях используй только русские кавычки «ёлочки» и „лапки“, "
+            "прямую двойную кавычку не используй."
+        ) if attempt else ""
+        data, err, status = await call_model(hint)
+        if err:
+            return JSONResponse(err, status_code=status)
+        last_data = data
+        if "error" in data:
+            return JSONResponse({"error": data["error"]}, status_code=status or 500)
+        parts = [b.get("text", "") for b in (data.get("content") or []) if b.get("type") == "text"]
+        result = extract_json("".join(parts))
+        if result and isinstance(result.get("problems"), list) and result["problems"]:
+            break
+
+    if not result or not isinstance(result.get("problems"), list) or not result["problems"]:
+        return JSONResponse({"error": "Не удалось разобрать ответ модели — попробуйте ещё раз"}, status_code=502)
+
+    return JSONResponse({"url": url, **result, "usage": (last_data or {}).get("usage", {})})
 
 
 @app.get("/")
