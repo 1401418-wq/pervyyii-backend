@@ -1040,17 +1040,19 @@ async def audit(request: Request):
     # Fallback на Jina Reader: либо нам отказали, либо это SPA с пустым HTML.
     # Передаём в Jina тот URL, который реально открылся (или исходный, если ничего не вышло).
     jina_text = ""
+    jina_status = "skipped"
     if not site_ok or len(parsed["body_text"]) < 500:
         try:
-            async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
                 jina = await client.get(
                     f"https://r.jina.ai/{site_url}",
                     headers={"Accept": "text/plain", "X-Return-Format": "text"},
                 )
+                jina_status = f"http_{jina.status_code}_len_{len(jina.text or '')}"
                 if jina.status_code < 400 and jina.text:
                     jina_text = jina.text[:8000]
-        except httpx.HTTPError:
-            pass
+        except httpx.HTTPError as e:
+            jina_status = f"error_{type(e).__name__}"
 
     if not site_ok and not jina_text:
         return JSONResponse(
@@ -1149,7 +1151,12 @@ async def audit(request: Request):
     if not result or not isinstance(result.get("problems"), list) or not result["problems"]:
         return JSONResponse({"error": "Не удалось разобрать ответ модели — попробуйте ещё раз"}, status_code=502)
 
-    return JSONResponse({"url": url, **result, "usage": (last_data or {}).get("usage", {})})
+    return JSONResponse({
+        "url": url,
+        **result,
+        "usage": (last_data or {}).get("usage", {}),
+        "debug": {"site_ok": site_ok, "html_text_len": len(parsed["body_text"]), "jina": jina_status},
+    })
 
 
 @app.get("/")
