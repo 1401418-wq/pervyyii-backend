@@ -984,7 +984,7 @@ def _normalize_url(raw: str) -> str:
 _audit_rate: dict[str, list[float]] = {}
 
 
-def _rate_limited(ip: str, limit: int = 30, window: int = 3600) -> bool:
+def _rate_limited(ip: str, limit: int = 10, window: int = 3600) -> bool:
     import time
     now = time.time()
     bucket = [t for t in _audit_rate.get(ip, []) if now - t < window]
