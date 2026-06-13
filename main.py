@@ -31,6 +31,9 @@ TELEGRAM_SUBSCRIBE_CODE = os.environ.get("TELEGRAM_SUBSCRIBE_CODE", "")
 BROADCAST_SECRET = os.environ.get("BROADCAST_SECRET", "")
 DEMO_BOT_TOKEN = os.environ.get("DEMO_BOT_TOKEN", "")
 DEMO_WEBHOOK_SECRET = os.environ.get("DEMO_WEBHOOK_SECRET", "")
+ALERTS_BOT_TOKEN = os.environ.get("ALERTS_BOT_TOKEN", "")
+ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # для авторегистрации webhook
 
 SYSTEM = """Ты — AI-консультант на сайте компании «Первый ИИ» (pervyyii.ru).
 Компания создаёт и внедряет AI-агентов для российского бизнеса.
@@ -249,9 +252,19 @@ CREATE TABLE IF NOT EXISTS telegram_subscribers (
     subscribed_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS alerts_subscribers (
+    chat_id BIGINT NOT NULL,
+    source TEXT NOT NULL,
+    username TEXT,
+    first_name TEXT,
+    subscribed_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (chat_id, source)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_lead ON sessions(has_lead) WHERE has_lead = TRUE;
+CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts_subscribers(source);
 """
 
 
@@ -269,6 +282,7 @@ async def startup() -> None:
         async with pool.acquire() as conn:
             await conn.execute(SCHEMA_SQL)
         print("[startup] DB pool ready, schema applied")
+        await _register_alerts_webhook()
     except Exception as e:
         print(f"[startup] DB init failed: {e}")
         pool = None
@@ -357,6 +371,122 @@ async def _tg_send_to(chat_id: int, text: str) -> None:
             )
     except Exception as e:
         print(f"[tg] direct send failed: {e}")
+
+
+# ─────────────────── Alerts bot (external clients) ───────────────────
+
+async def _register_alerts_webhook() -> None:
+    """Set the alerts bot webhook to our public URL on startup. No-op if not configured."""
+    if not (ALERTS_BOT_TOKEN and ALERTS_WEBHOOK_SECRET and PUBLIC_BASE_URL):
+        return
+    url = f"{PUBLIC_BASE_URL.rstrip('/')}/alerts/webhook/{ALERTS_WEBHOOK_SECRET}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{ALERTS_BOT_TOKEN}/setWebhook",
+                json={"url": url, "allowed_updates": ["message"]},
+            )
+            data = r.json()
+            if data.get("ok"):
+                print(f"[alerts] webhook set: {url}")
+            else:
+                print(f"[alerts] setWebhook failed: {data}")
+    except Exception as e:
+        print(f"[alerts] webhook registration failed: {e}")
+
+
+async def _alerts_send_to(chat_id: int, text: str, parse_mode: str | None = "HTML") -> None:
+    if not ALERTS_BOT_TOKEN:
+        return
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{ALERTS_BOT_TOKEN}/sendMessage",
+                json=payload,
+            )
+            if r.status_code >= 400 and parse_mode:
+                payload.pop("parse_mode", None)
+                await client.post(
+                    f"https://api.telegram.org/bot{ALERTS_BOT_TOKEN}/sendMessage",
+                    json=payload,
+                )
+    except Exception as e:
+        print(f"[alerts] send to {chat_id} failed: {e}")
+
+
+async def alerts_send(source: str, text: str) -> None:
+    """Send a message to all subscribers of a specific source. Fire-and-forget."""
+    if not (ALERTS_BOT_TOKEN and pool and source):
+        return
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT chat_id FROM alerts_subscribers WHERE source=$1",
+                source,
+            )
+        for r in rows:
+            await _alerts_send_to(r["chat_id"], text)
+    except Exception as e:
+        print(f"[alerts] alerts_send failed: {e}")
+
+
+@app.post("/alerts/webhook/{secret}")
+async def alerts_webhook(secret: str, request: Request):
+    if not ALERTS_WEBHOOK_SECRET or not secrets.compare_digest(secret, ALERTS_WEBHOOK_SECRET):
+        raise HTTPException(404)
+    if not pool:
+        return {"ok": True}
+    update = await request.json()
+    msg = update.get("message") or update.get("edited_message") or {}
+    text = (msg.get("text") or "").strip()
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return {"ok": True}
+
+    if text.startswith("/start"):
+        # Deep-link: /start <source>. If no source — explain and exit silently.
+        parts = text.split(maxsplit=1)
+        source = parts[1].strip().lower() if len(parts) > 1 else ""
+        if not source or not source.replace("-", "").replace("_", "").isalnum() or len(source) > 32:
+            await _alerts_send_to(
+                chat_id,
+                "Этот бот подключается по личной ссылке от «Первого ИИ». "
+                "Перейдите по ссылке, которую вам прислали — она содержит код подключения.",
+                parse_mode=None,
+            )
+            return {"ok": True}
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO alerts_subscribers (chat_id, source, username, first_name)
+                       VALUES ($1, $2, $3, $4)
+                       ON CONFLICT (chat_id, source) DO UPDATE
+                       SET username=EXCLUDED.username, first_name=EXCLUDED.first_name""",
+                    chat_id, source, chat.get("username"), chat.get("first_name"),
+                )
+            await _alerts_send_to(
+                chat_id,
+                f"Подключено ✓\n\nВы будете получать заявки с сайта "
+                f"<b>{source}</b> прямо сюда. "
+                f"Каждая новая заявка — отдельным сообщением.",
+            )
+        except Exception as e:
+            print(f"[alerts] /start failed: {e}")
+            await _alerts_send_to(chat_id, "Не удалось подключить. Попробуйте позже.", parse_mode=None)
+
+    elif text.startswith("/stop"):
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM alerts_subscribers WHERE chat_id=$1", chat_id)
+            await _alerts_send_to(chat_id, "Отключено. Уведомления больше не приходят.", parse_mode=None)
+        except Exception as e:
+            print(f"[alerts] /stop failed: {e}")
+
+    return {"ok": True}
 
 
 # ─────────────────── Demo bot (public) ───────────────────
@@ -844,8 +974,13 @@ async def admin_session_detail(session_id: str, request: Request):
 
 @app.post("/broadcast")
 async def broadcast(request: Request):
-    """Receive a lead notification from another family backend and fan out via Telegram.
-    Auth: X-Broadcast-Secret header matching BROADCAST_SECRET env."""
+    """Receive a lead notification from a client backend and fan out via Telegram.
+    Auth: X-Broadcast-Secret header matching BROADCAST_SECRET env.
+
+    Routing:
+      - route="family" (default): family hub bot @pervyyii_leads_bot, all subscribers
+      - route="alerts": alerts bot, only subscribers of `source`
+    """
     if not BROADCAST_SECRET:
         raise HTTPException(503, "broadcast not configured")
     if not secrets.compare_digest(request.headers.get("x-broadcast-secret", ""), BROADCAST_SECRET):
@@ -857,7 +992,9 @@ async def broadcast(request: Request):
     niche = payload.get("niche") or "—"
     tariff = payload.get("tariff") or "—"
     summary = payload.get("summary") or ""
-    await tg_send(
+    route = (payload.get("route") or "family").lower()
+
+    text = (
         f"🎯 <b>Новая заявка с {source}</b>\n\n"
         f"<b>Имя:</b> {name}\n"
         f"<b>Контакт:</b> {contact}\n"
@@ -865,6 +1002,12 @@ async def broadcast(request: Request):
         f"<b>Интерес:</b> {tariff}\n\n"
         f"<i>{summary}</i>"
     )
+
+    if route == "alerts":
+        await alerts_send(source, text)
+    else:
+        await tg_send(text)
+
     return {"ok": True}
 
 
