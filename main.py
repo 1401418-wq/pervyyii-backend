@@ -448,15 +448,19 @@ async def alerts_webhook(secret: str, request: Request):
         return {"ok": True}
 
     if text.startswith("/start"):
-        # Deep-link: /start <source>. If no source — explain and exit silently.
+        # Deep-link: /start <source>. If no source — explain how to subscribe.
         parts = text.split(maxsplit=1)
         source = parts[1].strip().lower() if len(parts) > 1 else ""
         if not source or not source.replace("-", "").replace("_", "").isalnum() or len(source) > 32:
             await _alerts_send_to(
                 chat_id,
-                "Этот бот подключается по личной ссылке от «Первого ИИ». "
-                "Перейдите по ссылке, которую вам прислали — она содержит код подключения.",
-                parse_mode=None,
+                "Привет! Это бот уведомлений «Первого ИИ» — сюда приходят заявки "
+                "с сайтов, на которых работает наш AI-помощник.\n\n"
+                "Чтобы подключиться, откройте персональную ссылку, "
+                "которую вам прислали — она содержит код подключения "
+                "(пример: <code>?start=ваш_сайт</code>).\n\n"
+                "Если ссылка не сработала, перешлите её ещё раз и нажмите "
+                "кнопку «Start» внутри Telegram.",
             )
             return {"ok": True}
         try:
@@ -986,7 +990,8 @@ async def broadcast(request: Request):
     if not secrets.compare_digest(request.headers.get("x-broadcast-secret", ""), BROADCAST_SECRET):
         raise HTTPException(401, "bad secret")
     payload = await request.json()
-    source = payload.get("source") or "—"
+    source = (payload.get("source") or "—").lower()
+    source_display = payload.get("source_display") or payload.get("source") or "—"
     name = payload.get("name") or "—"
     contact = payload.get("contact") or "—"
     niche = payload.get("niche") or "—"
@@ -995,7 +1000,7 @@ async def broadcast(request: Request):
     route = (payload.get("route") or "family").lower()
 
     text = (
-        f"🎯 <b>Новая заявка с {source}</b>\n\n"
+        f"🎯 <b>Новая заявка с {source_display}</b>\n\n"
         f"<b>Имя:</b> {name}\n"
         f"<b>Контакт:</b> {contact}\n"
         f"<b>Кто/Сфера:</b> {niche}\n"
