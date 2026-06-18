@@ -33,6 +33,8 @@ DEMO_BOT_TOKEN = os.environ.get("DEMO_BOT_TOKEN", "")
 DEMO_WEBHOOK_SECRET = os.environ.get("DEMO_WEBHOOK_SECRET", "")
 ALERTS_BOT_TOKEN = os.environ.get("ALERTS_BOT_TOKEN", "")
 ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
+BUSINESS_BOT_TOKEN = os.environ.get("BUSINESS_BOT_TOKEN", "")
+BUSINESS_WEBHOOK_SECRET = os.environ.get("BUSINESS_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # для авторегистрации webhook
 
 SYSTEM = """Ты — AI-консультант на сайте компании «Первый ИИ» (pervyyii.ru).
@@ -285,6 +287,16 @@ CREATE TABLE IF NOT EXISTS alerts_subscribers (
     PRIMARY KEY (chat_id, source)
 );
 
+CREATE TABLE IF NOT EXISTS business_connections (
+    user_chat_id BIGINT PRIMARY KEY,
+    business_connection_id TEXT NOT NULL,
+    username TEXT,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    can_reply BOOLEAN DEFAULT TRUE,
+    connected_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_lead ON sessions(has_lead) WHERE has_lead = TRUE;
@@ -307,6 +319,7 @@ async def startup() -> None:
             await conn.execute(SCHEMA_SQL)
         print("[startup] DB pool ready, schema applied")
         await _register_alerts_webhook()
+        await _register_business_webhook()
     except Exception as e:
         print(f"[startup] DB init failed: {e}")
         pool = None
@@ -702,6 +715,233 @@ async def demo_webhook(secret: str, request: Request):
         print(f"[demo] db post-call failed: {e}")
 
     await demo_send(chat_id, reply)
+    return {"ok": True}
+
+
+# ─────────────────── Business bot (Telegram Business на @First01_AI) ───────────────────
+
+async def _register_business_webhook() -> None:
+    if not (BUSINESS_BOT_TOKEN and BUSINESS_WEBHOOK_SECRET and PUBLIC_BASE_URL):
+        return
+    url = f"{PUBLIC_BASE_URL.rstrip('/')}/business/webhook/{BUSINESS_WEBHOOK_SECRET}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{BUSINESS_BOT_TOKEN}/setWebhook",
+                json={
+                    "url": url,
+                    "allowed_updates": [
+                        "business_connection",
+                        "business_message",
+                        "edited_business_message",
+                    ],
+                },
+            )
+            data = r.json()
+            if data.get("ok"):
+                print(f"[business] webhook set: {url}")
+            else:
+                print(f"[business] setWebhook failed: {data}")
+    except Exception as e:
+        print(f"[business] webhook registration failed: {e}")
+
+
+async def _business_send(business_connection_id: str, chat_id: int, text: str) -> None:
+    if not BUSINESS_BOT_TOKEN:
+        return
+    payload = {
+        "business_connection_id": business_connection_id,
+        "chat_id": chat_id,
+        "text": text[:4000],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{BUSINESS_BOT_TOKEN}/sendMessage",
+                json=payload,
+            )
+            if r.status_code >= 400:
+                print(f"[business] sendMessage failed: {r.status_code} {r.text[:300]}")
+    except Exception as e:
+        print(f"[business] send failed: {e}")
+
+
+async def _business_typing(business_connection_id: str, chat_id: int) -> None:
+    if not BUSINESS_BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{BUSINESS_BOT_TOKEN}/sendChatAction",
+                json={
+                    "business_connection_id": business_connection_id,
+                    "chat_id": chat_id,
+                    "action": "typing",
+                },
+            )
+    except Exception:
+        pass
+
+
+@app.post("/business/webhook/{secret}")
+async def business_webhook(secret: str, request: Request):
+    if not BUSINESS_WEBHOOK_SECRET or not secrets.compare_digest(secret, BUSINESS_WEBHOOK_SECRET):
+        raise HTTPException(404)
+    if not (BUSINESS_BOT_TOKEN and ANTHROPIC_API_KEY):
+        return {"ok": True}
+
+    update = await request.json()
+
+    bc = update.get("business_connection")
+    if bc:
+        if pool:
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO business_connections
+                            (user_chat_id, business_connection_id, username, is_enabled, can_reply, updated_at)
+                           VALUES ($1, $2, $3, $4, $5, NOW())
+                           ON CONFLICT (user_chat_id) DO UPDATE
+                           SET business_connection_id=EXCLUDED.business_connection_id,
+                               username=EXCLUDED.username,
+                               is_enabled=EXCLUDED.is_enabled,
+                               can_reply=EXCLUDED.can_reply,
+                               updated_at=NOW()""",
+                        bc.get("user_chat_id"),
+                        bc.get("id"),
+                        (bc.get("user") or {}).get("username"),
+                        bool(bc.get("is_enabled", True)),
+                        bool(bc.get("can_reply", True)),
+                    )
+            except Exception as e:
+                print(f"[business] connection store failed: {e}")
+        print(f"[business] connection update: user={bc.get('user_chat_id')} enabled={bc.get('is_enabled')} can_reply={bc.get('can_reply')}")
+        return {"ok": True}
+
+    msg = update.get("business_message") or update.get("edited_business_message") or {}
+    if not msg:
+        return {"ok": True}
+
+    business_connection_id = msg.get("business_connection_id")
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    sender = msg.get("from") or {}
+    sender_id = sender.get("id")
+    text = (msg.get("text") or "").strip()
+
+    if not (business_connection_id and chat_id and text):
+        return {"ok": True}
+
+    # Не отвечать на сообщения, которые пишет сам владелец бизнес-аккаунта.
+    # У Telegram Business в business_message приходят и входящие, и исходящие.
+    owner_chat_id = None
+    if pool:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT user_chat_id, is_enabled FROM business_connections WHERE business_connection_id=$1",
+                    business_connection_id,
+                )
+                if row:
+                    owner_chat_id = row["user_chat_id"]
+                    if not row["is_enabled"]:
+                        return {"ok": True}
+        except Exception as e:
+            print(f"[business] connection lookup failed: {e}")
+
+    if owner_chat_id and sender_id == owner_chat_id:
+        return {"ok": True}
+
+    text = text[:2000]
+    session_id = f"tg_biz_{business_connection_id}_{chat_id}"
+    username = sender.get("username") or ""
+    first_name = sender.get("first_name") or ""
+    user_label = f"@{username}" if username else first_name or str(chat_id)
+
+    if not pool:
+        return {"ok": True}
+
+    try:
+        async with pool.acquire() as conn:
+            history = await conn.fetch(
+                "SELECT role, content FROM messages WHERE session_id=$1 ORDER BY created_at LIMIT 40",
+                session_id,
+            )
+            await conn.execute(
+                """INSERT INTO sessions (session_id, user_agent, referrer, ip)
+                   VALUES ($1, 'telegram-business', $2, '')
+                   ON CONFLICT (session_id) DO UPDATE SET last_activity_at=NOW()""",
+                session_id, f"@First01_AI ← {user_label}",
+            )
+            await conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES ($1, 'user', $2)",
+                session_id, text[:8000],
+            )
+    except Exception as e:
+        print(f"[business] db pre-call failed: {e}")
+        history = []
+
+    await _business_typing(business_connection_id, chat_id)
+
+    messages_for_claude = [{"role": r["role"], "content": r["content"]} for r in history]
+    messages_for_claude.append({"role": "user", "content": text})
+
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1500,
+                    "system": [
+                        {
+                            "type": "text",
+                            "text": SYSTEM,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                    "messages": messages_for_claude,
+                },
+            )
+            data = response.json()
+    except httpx.HTTPError as e:
+        print(f"[business] upstream failed: {e}")
+        return {"ok": True}
+
+    if "error" in data:
+        print(f"[business] anthropic error: {data['error']}")
+        return {"ok": True}
+
+    content = data.get("content") or []
+    reply = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
+    if not reply:
+        return {"ok": True}
+
+    usage = data.get("usage") or {}
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO messages
+                    (session_id, role, content, input_tokens, output_tokens, cache_read)
+                   VALUES ($1, 'assistant', $2, $3, $4, $5)""",
+                session_id, reply[:8000],
+                usage.get("input_tokens"), usage.get("output_tokens"),
+                usage.get("cache_read_input_tokens"),
+            )
+            await conn.execute(
+                "UPDATE sessions SET msg_count = msg_count + 2, last_activity_at = NOW() WHERE session_id=$1",
+                session_id,
+            )
+        asyncio.create_task(extract_metadata(session_id, source="Telegram-Business @First01_AI"))
+    except Exception as e:
+        print(f"[business] db post-call failed: {e}")
+
+    await _business_send(business_connection_id, chat_id, reply)
     return {"ok": True}
 
 
