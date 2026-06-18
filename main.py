@@ -850,9 +850,11 @@ async def business_webhook(secret: str, request: Request):
             print(f"[business] connection lookup failed: {e}")
 
     if owner_chat_id and sender_id == owner_chat_id:
+        print(f"[business] skip own message from owner {sender_id} in chat {chat_id}")
         return {"ok": True}
 
     text = text[:2000]
+    print(f"[business] incoming chat={chat_id} from={sender_id} ({sender.get('username') or sender.get('first_name')}): {text[:120]}")
     session_id = f"tg_biz_{business_connection_id}_{chat_id}"
     username = sender.get("username") or ""
     first_name = sender.get("first_name") or ""
@@ -942,6 +944,7 @@ async def business_webhook(secret: str, request: Request):
         print(f"[business] db post-call failed: {e}")
 
     await _business_send(business_connection_id, chat_id, reply)
+    print(f"[business] reply sent to chat={chat_id} len={len(reply)}")
     return {"ok": True}
 
 
