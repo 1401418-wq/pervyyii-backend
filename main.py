@@ -1050,13 +1050,28 @@ _MD_BOLD_UND = re.compile(r"__(.+?)__", re.DOTALL)
 _MD_ITALIC_STAR = re.compile(r"(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)")
 _MD_ITALIC_UND = re.compile(r"(?<![A-Za-z0-9_])_(?!_)([^_\n]+?)(?<!_)_(?![A-Za-z0-9_])")
 _MD_CODE = re.compile(r"`([^`\n]+?)`")
-_MD_LIST_PREFIX = re.compile(r"(?m)^[ \t]*[-*+]\s+")
+_MD_LIST_PREFIX = re.compile(r"(?m)^[ \t]*(?:[-*+•]|\d+[.)])\s+")
 _MD_HEADING = re.compile(r"(?m)^[ \t]*#{1,6}\s+")
 _MD_BLOCKQUOTE = re.compile(r"(?m)^[ \t]*>\s?")
+_EMOJI = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"   # symbols & pictographs (включая 👋)
+    "\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F680-\U0001F6FF"   # transport & map
+    "\U0001F700-\U0001F77F"   # alchemical
+    "\U0001F900-\U0001F9FF"   # supplemental symbols
+    "\U0001FA70-\U0001FAFF"   # extended-A
+    "\U00002600-\U000026FF"   # misc symbols
+    "\U00002700-\U000027BF"   # dingbats
+    "\U0001F1E0-\U0001F1FF"   # flags
+    "]+",
+    flags=re.UNICODE,
+)
 
 
 def _strip_md(text: str) -> str:
-    """Убрать markdown-разметку: Telegram Business не парсит её и показывает сырыми символами."""
+    """Убрать markdown-разметку и эмодзи: Telegram Business не парсит markdown,
+    а маркетинговые буллеты + эмодзи мы запретили в overlay, но Haiku их пихает."""
     text = text.replace("```", "")
     text = _MD_BOLD_STAR.sub(r"\1", text)
     text = _MD_BOLD_UND.sub(r"\1", text)
@@ -1065,7 +1080,11 @@ def _strip_md(text: str) -> str:
     text = _MD_CODE.sub(r"\1", text)
     text = _MD_HEADING.sub("", text)
     text = _MD_BLOCKQUOTE.sub("", text)
-    text = _MD_LIST_PREFIX.sub("• ", text)
+    text = _MD_LIST_PREFIX.sub("", text)  # буллет/нумерация в начале строки → удалить полностью
+    text = _EMOJI.sub("", text)
+    # после удаления эмодзи могут остаться лишние пробелы — нормализуем
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r" +([.,!?])", r"\1", text)
     return text
 
 
