@@ -36,6 +36,7 @@ ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
 BUSINESS_BOT_TOKEN = os.environ.get("BUSINESS_BOT_TOKEN", "")
 BUSINESS_WEBHOOK_SECRET = os.environ.get("BUSINESS_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # для авторегистрации webhook
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # для распознавания голосовых через Whisper
 
 SYSTEM = """Ты — ИИ-консультант на сайте компании «Первый ИИ» (pervyyii.ru).
 Компания создаёт и внедряет ИИ-агентов для российского бизнеса.
@@ -994,6 +995,46 @@ async def _business_typing(business_connection_id: str, chat_id: int) -> None:
         pass
 
 
+async def _transcribe_voice(file_id: str) -> str | None:
+    """Скачать голосовое из Telegram и распознать через OpenAI Whisper. Возвращает текст или None."""
+    if not (BUSINESS_BOT_TOKEN and OPENAI_API_KEY):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            file_meta = await client.get(
+                f"https://api.telegram.org/bot{BUSINESS_BOT_TOKEN}/getFile",
+                params={"file_id": file_id},
+            )
+            meta_data = file_meta.json()
+            if not meta_data.get("ok"):
+                print(f"[business] getFile failed: {meta_data}")
+                return None
+            file_path = meta_data["result"]["file_path"]
+            file_url = f"https://api.telegram.org/file/bot{BUSINESS_BOT_TOKEN}/{file_path}"
+            audio_resp = await client.get(file_url)
+            if audio_resp.status_code != 200:
+                print(f"[business] voice download failed: {audio_resp.status_code}")
+                return None
+            audio_bytes = audio_resp.content
+        async with httpx.AsyncClient(timeout=60) as client:
+            whisper_resp = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files={"file": ("voice.oga", audio_bytes, "audio/ogg")},
+                data={"model": "whisper-1", "language": "ru"},
+            )
+            if whisper_resp.status_code != 200:
+                print(f"[business] whisper failed: {whisper_resp.status_code} {whisper_resp.text[:300]}")
+                return None
+            result = whisper_resp.json()
+            transcript = (result.get("text") or "").strip()
+            print(f"[business] voice transcribed ({len(audio_bytes)} bytes → {len(transcript)} chars): {transcript[:120]}")
+            return transcript or None
+    except Exception as e:
+        print(f"[business] voice transcribe failed: {e}")
+        return None
+
+
 @app.post("/business/webhook/{secret}")
 async def business_webhook(secret: str, request: Request):
     if not BUSINESS_WEBHOOK_SECRET or not secrets.compare_digest(secret, BUSINESS_WEBHOOK_SECRET):
@@ -1039,8 +1080,12 @@ async def business_webhook(secret: str, request: Request):
     sender = msg.get("from") or {}
     sender_id = sender.get("id")
     text = (msg.get("text") or "").strip()
+    voice = msg.get("voice") or msg.get("audio")
+    non_text_media = any(msg.get(k) for k in ("photo", "sticker", "video", "video_note", "document", "animation"))
 
-    if not (business_connection_id and chat_id and text):
+    if not (business_connection_id and chat_id):
+        return {"ok": True}
+    if not (text or voice or non_text_media):
         return {"ok": True}
 
     # Не отвечать на сообщения, которые пишет сам владелец бизнес-аккаунта.
@@ -1064,8 +1109,31 @@ async def business_webhook(secret: str, request: Request):
         print(f"[business] skip own message from owner {sender_id} in chat {chat_id}")
         return {"ok": True}
 
+    # Голосовое → распознаём через Whisper, дальше обрабатываем как текст
+    voice_transcribed = False
+    if voice and not text:
+        await _business_typing(business_connection_id, chat_id)
+        transcript = await _transcribe_voice(voice.get("file_id"))
+        if transcript:
+            text = transcript
+            voice_transcribed = True
+        else:
+            await _business_send(business_connection_id, chat_id,
+                "Не смог разобрать голосовое — напишите, пожалуйста, текстом, отвечу подробно.")
+            return {"ok": True}
+
+    # Фото / стикер / видео / документ — мягкая отбивка
+    if non_text_media and not text:
+        await _business_send(business_connection_id, chat_id,
+            "Пока понимаю только текст и голосовые сообщения. Напишите коротко, что вас интересует, и я подробно расскажу.")
+        return {"ok": True}
+
+    if not text:
+        return {"ok": True}
+
     text = text[:2000]
-    print(f"[business] incoming chat={chat_id} from={sender_id} ({sender.get('username') or sender.get('first_name')}): {text[:120]}")
+    log_prefix = "voice→text" if voice_transcribed else "text"
+    print(f"[business] incoming [{log_prefix}] chat={chat_id} from={sender_id} ({sender.get('username') or sender.get('first_name')}): {text[:120]}")
     session_id = f"tg_biz_{business_connection_id}_{chat_id}"
     username = sender.get("username") or ""
     first_name = sender.get("first_name") or ""
