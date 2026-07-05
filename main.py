@@ -10,14 +10,23 @@ import base64
 import secrets
 import asyncio
 import asyncpg
+import socket
+import ipaddress
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
 app = FastAPI()
 
+ALLOWED_ORIGINS = [
+    "https://pervyyii.ru",
+    "https://www.pervyyii.ru",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -37,6 +46,59 @@ BUSINESS_BOT_TOKEN = os.environ.get("BUSINESS_BOT_TOKEN", "")
 BUSINESS_WEBHOOK_SECRET = os.environ.get("BUSINESS_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # для авторегистрации webhook
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # для распознавания голосовых через Whisper
+
+# ─────────────────── Лимиты и защита от абуза ───────────────────
+import time as _time
+
+_rate_buckets: dict[str, list[float]] = {}
+
+# Потолки на тело /chat, чтобы нельзя было раздувать токен-счёт
+MAX_MESSAGES = 40
+MAX_MSG_CHARS = 8000
+MAX_TOTAL_CHARS = 24000
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limited(key: str, limit: int = 10, window: int = 3600) -> bool:
+    now = _time.time()
+    bucket = [t for t in _rate_buckets.get(key, []) if now - t < window]
+    if len(bucket) >= limit:
+        _rate_buckets[key] = bucket
+        return True
+    bucket.append(now)
+    _rate_buckets[key] = bucket
+    # аварийная чистка, чтобы словарь не рос бесконечно
+    if len(_rate_buckets) > 10000:
+        for k in [k for k, v in _rate_buckets.items() if not [t for t in v if now - t < window]]:
+            _rate_buckets.pop(k, None)
+    return False
+
+
+def _validate_chat_messages(messages) -> str | None:
+    """Возвращает текст ошибки, если тело не проходит лимиты, иначе None."""
+    if not isinstance(messages, list) or not messages:
+        return "messages is empty"
+    if len(messages) > MAX_MESSAGES:
+        return "too many messages"
+    total = 0
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            return "invalid message role"
+        content = m.get("content")
+        if not isinstance(content, str):
+            return "message content must be a string"
+        if len(content) > MAX_MSG_CHARS:
+            return "message too long"
+        total += len(content)
+    if total > MAX_TOTAL_CHARS:
+        return "conversation too long"
+    return None
 
 SYSTEM = """Ты — ИИ-ассистент компании «Первый ИИ» (pervyyii.ru). Компания создаёт
 и внедряет ИИ-агентов для российского бизнеса. Ты сам — живой пример того,
@@ -966,6 +1028,14 @@ async def demo_webhook(secret: str, request: Request):
         )
         return {"ok": True}
 
+    # Абуз-лимит: публичный бот, каждый ответ = дорогой вызов Sonnet
+    if _rate_limited(f"demo:{chat_id}", limit=20, window=3600):
+        await demo_send(chat_id, "Слишком много сообщений подряд. Продолжим через часок — а пока загляните на pervyyii.ru.")
+        return {"ok": True}
+    if _rate_limited("demo:_global", limit=200, window=3600):
+        await demo_send(chat_id, "Сейчас очень много запросов, попробуйте чуть позже.")
+        return {"ok": True}
+
     # Regular conversational turn
     if not pool:
         await demo_send(chat_id, "Сервис временно недоступен. Попробуйте позже.")
@@ -1511,14 +1581,24 @@ async def chat(request: Request):
             status_code=500,
         )
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     messages = body.get("messages", [])
-    if not messages:
-        return JSONResponse({"error": "messages is empty"}, status_code=400)
+    err = _validate_chat_messages(messages)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+
+    ip = _client_ip(request)
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown"):
+        if _rate_limited(f"chat:{ip}", limit=60, window=3600):
+            return JSONResponse({"error": "Слишком много запросов. Попробуйте позже."}, status_code=429)
+    if _rate_limited("chat:_global", limit=300, window=60):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте через минуту."}, status_code=429)
 
     session_id = body.get("session_id") or str(uuid.uuid4())
     referrer = body.get("referrer") or ""
-    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "").split(",")[0].strip()
     user_agent = request.headers.get("user-agent", "")[:500]
 
     # Log user message (the last one in history is what they just sent)
@@ -1566,13 +1646,15 @@ async def chat(request: Request):
         return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
 
     if "error" in data:
-        return JSONResponse({"error": data["error"]}, status_code=response.status_code or 500)
+        print(f"[chat] upstream error: {data['error']}")
+        return JSONResponse({"error": "upstream error"}, status_code=response.status_code or 500)
 
     content = data.get("content") or []
     text_parts = [block.get("text", "") for block in content if block.get("type") == "text"]
     reply = "".join(text_parts).strip()
     if not reply:
-        return JSONResponse({"error": "empty reply from model", "raw": data}, status_code=502)
+        print(f"[chat] empty reply, raw={data}")
+        return JSONResponse({"error": "empty reply from model"}, status_code=502)
 
     usage = data.get("usage") or {}
 
@@ -1869,19 +1951,48 @@ def _normalize_url(raw: str) -> str:
     return raw
 
 
-_audit_rate: dict[str, list[float]] = {}
+def _ip_is_public(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
 
 
-def _rate_limited(ip: str, limit: int = 10, window: int = 3600) -> bool:
-    import time
-    now = time.time()
-    bucket = [t for t in _audit_rate.get(ip, []) if now - t < window]
-    if len(bucket) >= limit:
-        _audit_rate[ip] = bucket
-        return True
-    bucket.append(now)
-    _audit_rate[ip] = bucket
-    return False
+async def _host_is_public(host: str) -> bool:
+    """Резолвит хост и требует, чтобы ВСЕ адреса были публичными — анти-SSRF.
+    Остаточный риск DNS-rebinding (резолв тут ≠ резолв httpx при коннекте)
+    вынесен на глубокую проверку Opus."""
+    try:
+        loop = asyncio.get_event_loop()
+        infos = await loop.getaddrinfo(host, None)
+    except Exception:
+        return False
+    ips = {i[4][0] for i in infos}
+    return bool(ips) and all(_ip_is_public(ip) for ip in ips)
+
+
+async def _safe_fetch(url: str, verify: bool, headers: dict, max_redirects: int = 5):
+    """GET с ручным следованием редиректам и проверкой публичности каждого хопа."""
+    current = url
+    for _ in range(max_redirects + 1):
+        p = urlparse(current)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return None
+        if p.port and p.port not in (80, 443):
+            return None
+        if not await _host_is_public(p.hostname):
+            return None
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False, verify=verify) as client:
+            resp = await client.get(current, headers=headers)
+        if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
+            current = str(resp.url.join(resp.headers["location"]))
+            continue
+        return resp
+    return None
 
 
 @app.post("/audit")
@@ -1889,14 +2000,22 @@ async def audit(request: Request):
     if not ANTHROPIC_API_KEY:
         return JSONResponse({"error": "ANTHROPIC_API_KEY is not configured"}, status_code=500)
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     url = _normalize_url(body.get("url", ""))
     if not url:
         return JSONResponse({"error": "Укажите корректный адрес сайта"}, status_code=400)
 
-    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "").split(",")[0].strip() or "unknown"
-    if ip not in ("127.0.0.1", "::1", "localhost", "unknown") and _rate_limited(ip):
+    ip = _client_ip(request)
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown") and _rate_limited(f"audit:{ip}"):
         return JSONResponse({"error": "Слишком много запросов. Попробуйте через час."}, status_code=429)
+    if _rate_limited("audit:_global", limit=60, window=3600):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте позже."}, status_code=429)
+
+    if not await _host_is_public(urlparse(url).hostname or ""):
+        return JSONResponse({"error": "Этот адрес недоступен для проверки"}, status_code=400)
 
     ua_headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -1913,8 +2032,9 @@ async def audit(request: Request):
     site_ok = False
     for candidate_url, verify in candidates:
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True, verify=verify) as client:
-                resp = await client.get(candidate_url, headers=ua_headers)
+            resp = await _safe_fetch(candidate_url, verify, ua_headers)
+            if resp is None:
+                continue
             if resp.status_code < 400:
                 site_html = resp.text
                 site_url = str(resp.url)
