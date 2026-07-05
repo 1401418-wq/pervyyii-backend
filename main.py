@@ -85,7 +85,7 @@ def _rate_limited(key: str, limit: int = 10, window: int = 3600) -> bool:
 # Реальные значения остаются на сервере, ответ обратно un-mask'ается для пользователя.
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _TG_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,}")
-_PHONE_RE = re.compile(r"(?:\+?7|8)?[\s\-(]?\d{3}[\s\-)]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
+_PHONE_RE = re.compile(r"\+?[78]?[\s\-()]*\d(?:[\s\-()]*\d){9,10}")
 _NAME_RE = re.compile(r"(меня зовут|мо[её] имя|зовут меня)\s+([А-ЯЁ][а-яё]+)", re.I)
 
 
