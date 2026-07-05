@@ -1292,7 +1292,7 @@ async def _transcribe_voice(file_id: str) -> str | None:
                 return None
             result = whisper_resp.json()
             transcript = (result.get("text") or "").strip()
-            print(f"[business] voice transcribed ({len(audio_bytes)} bytes → {len(transcript)} chars): {transcript[:120]}")
+            print(f"[business] voice transcribed ({len(audio_bytes)} bytes → {len(transcript)} chars)")
             return transcript or None
     except Exception as e:
         print(f"[business] voice transcribe failed: {e}")
@@ -1397,7 +1397,7 @@ async def business_webhook(secret: str, request: Request):
 
     text = text[:2000]
     log_prefix = "voice→text" if voice_transcribed else "text"
-    print(f"[business] incoming [{log_prefix}] chat={chat_id} from={sender_id} ({sender.get('username') or sender.get('first_name')}): {text[:120]}")
+    print(f"[business] incoming [{log_prefix}] chat={chat_id} from={sender_id} len={len(text)}")
     session_id = f"tg_biz_{business_connection_id}_{chat_id}"
     username = sender.get("username") or ""
     first_name = sender.get("first_name") or ""
