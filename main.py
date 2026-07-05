@@ -80,6 +80,68 @@ def _rate_limited(key: str, limit: int = 10, window: int = 3600) -> bool:
     return False
 
 
+# ─────────────────── Обезличивание ПД перед отправкой за рубеж (152-ФЗ) ───────────────────
+# За границу (Anthropic/OpenAI) уходит только текст с плейсхолдерами вместо ПД.
+# Реальные значения остаются на сервере, ответ обратно un-mask'ается для пользователя.
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_TG_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,}")
+_PHONE_RE = re.compile(r"(?:\+?7|8)?[\s\-(]?\d{3}[\s\-)]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
+_NAME_RE = re.compile(r"(меня зовут|мо[её] имя|зовут меня)\s+([А-ЯЁ][а-яё]+)", re.I)
+
+
+def _mask_pii(text: str, mapping: dict) -> str:
+    if not isinstance(text, str):
+        return text
+
+    def _ph(kind: str, val: str) -> str:
+        for ph, v in mapping.items():
+            if v == val:
+                return ph
+        ph = f"[{kind}_{len(mapping) + 1}]"
+        mapping[ph] = val
+        return ph
+
+    text = _EMAIL_RE.sub(lambda m: _ph("EMAIL", m.group(0)), text)
+    text = _TG_RE.sub(lambda m: _ph("TG", m.group(0)), text)
+    text = _PHONE_RE.sub(lambda m: _ph("PHONE", m.group(0)), text)
+    text = _NAME_RE.sub(lambda m: m.group(1) + " " + _ph("NAME", m.group(2)), text)
+    return text
+
+
+def _unmask(text: str, mapping: dict) -> str:
+    for ph, val in mapping.items():
+        text = text.replace(ph, val)
+    return text
+
+
+def _mask_messages(messages: list) -> tuple[list, dict]:
+    """(обезличенные messages, mapping) — для зарубежного LLM."""
+    mapping: dict = {}
+    masked = [
+        {"role": m["role"], "content": _mask_pii(str(m.get("content", "")), mapping)}
+        for m in messages
+    ]
+    return masked, mapping
+
+
+def _extract_contact_local(text: str) -> dict:
+    """Извлекает контакт из текста ЛОКАЛЬНО (без LLM) — чтобы ПД не уходили за рубеж."""
+    phone = _PHONE_RE.search(text)
+    tg = _TG_RE.search(text)
+    email = _EMAIL_RE.search(text)
+    name_m = _NAME_RE.search(text)
+    if phone:
+        contact = phone.group(0).strip()
+    elif tg:
+        contact = tg.group(0).strip()
+    elif email:
+        contact = email.group(0).strip()
+    else:
+        contact = None
+    name = name_m.group(2) if name_m else None
+    return {"name": name, "contact": contact, "has_lead": bool(contact)}
+
+
 def _validate_chat_messages(messages) -> str | None:
     """Возвращает текст ошибки, если тело не проходит лимиты, иначе None."""
     if not isinstance(messages, list) or not messages:
@@ -1082,6 +1144,7 @@ async def demo_webhook(secret: str, request: Request):
 
     messages_for_claude = [{"role": r["role"], "content": r["content"]} for r in history]
     messages_for_claude.append({"role": "user", "content": text})
+    masked_for_claude, pii_map = _mask_messages(messages_for_claude)
 
     try:
         async with httpx.AsyncClient(timeout=90) as client:
@@ -1102,7 +1165,7 @@ async def demo_webhook(secret: str, request: Request):
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    "messages": messages_for_claude,
+                    "messages": masked_for_claude,
                 },
             )
             data = response.json()
@@ -1118,6 +1181,7 @@ async def demo_webhook(secret: str, request: Request):
 
     content = data.get("content") or []
     reply = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
+    reply = _unmask(reply, pii_map)
     if not reply:
         await demo_send(chat_id, "Не получилось сгенерировать ответ. Попробуйте переформулировать.")
         return {"ok": True}
@@ -1430,6 +1494,7 @@ async def business_webhook(secret: str, request: Request):
 
     messages_for_claude = [{"role": r["role"], "content": r["content"]} for r in history]
     messages_for_claude.append({"role": "user", "content": text})
+    masked_for_claude, pii_map = _mask_messages(messages_for_claude)
 
     try:
         async with httpx.AsyncClient(timeout=90) as client:
@@ -1454,7 +1519,7 @@ async def business_webhook(secret: str, request: Request):
                             "text": BUSINESS_OVERLAY,
                         },
                     ],
-                    "messages": messages_for_claude,
+                    "messages": masked_for_claude,
                 },
             )
             data = response.json()
@@ -1468,6 +1533,7 @@ async def business_webhook(secret: str, request: Request):
 
     content = data.get("content") or []
     reply = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
+    reply = _unmask(reply, pii_map)
     if not reply:
         return {"ok": True}
 
@@ -1497,17 +1563,14 @@ async def business_webhook(secret: str, request: Request):
 
 # ─────────────────── Metadata extraction ───────────────────
 
-EXTRACTION_SYSTEM = """Ты обрабатываешь диалог посетителя сайта с ИИ-агентом, который продаёт услугу ИИ-агентов для бизнеса.
+EXTRACTION_SYSTEM = """Ты обрабатываешь диалог посетителя сайта с ИИ-агентом, который продаёт услугу ИИ-агентов для бизнеса. Контактные данные уже вырезаны и заменены плейсхолдерами вида [NAME_1], [PHONE_2] — не пытайся их угадать.
 
 Извлеки структурированные данные. Верни СТРОГО валидный JSON, без markdown, без комментариев, в одну строку или с переносами. Поля:
 
 {
   "business_niche": одна из строк ["дизайн интерьера","салон красоты","юр.услуги","недвижимость","медицина","образование","фитнес","рестораны","ритейл","автоуслуги","строительство","ивенты","IT","другое","не определено"],
   "tariff_interest": одна из ["Старт","Про","Индивидуальный","Голосовой агент","WhatsApp-агент","Авито-агент","Ответы на отзывы","Контент для соцсетей","несколько","не определено"],
-  "intent_summary": строка 1-2 предложения, что человек спрашивал и чего хочет,
-  "has_lead": true ТОЛЬКО если человек явно оставил имя И контакт (телефон или telegram). Если оставил только имя или только сферу — false.,
-  "lead_name": имя или null,
-  "lead_contact": контакт или null
+  "intent_summary": строка 1-2 предложения, что человек спрашивал и чего хочет
 }"""
 
 
@@ -1529,6 +1592,12 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
         if not rows:
             return
         transcript = "\n\n".join(f"[{r['role']}] {r['content']}" for r in rows)
+        # Контакт извлекаем ЛОКАЛЬНО (в Claude ПД не уходят)
+        local = _extract_contact_local(transcript)
+        has_lead_new = local["has_lead"]
+        # Нишу/тариф/интент — из Claude по ОБЕЗЛИЧЕННОМУ транскрипту
+        emap: dict = {}
+        masked_transcript = _mask_pii(transcript, emap)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 "https://api.anthropic.com/v1/messages",
@@ -1541,7 +1610,7 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 400,
                     "system": EXTRACTION_SYSTEM,
-                    "messages": [{"role": "user", "content": transcript}],
+                    "messages": [{"role": "user", "content": masked_transcript}],
                 },
             )
             data = response.json()
@@ -1550,7 +1619,7 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
         if text.startswith("```"):
             text = text.strip("`").lstrip("json").strip()
         extracted = json.loads(text)
-        has_lead_new = bool(extracted.get("has_lead"))
+        intent_summary = _unmask(extracted.get("intent_summary") or "", emap)
         async with pool.acquire() as conn:
             await conn.execute(
                 """UPDATE sessions SET
@@ -1560,18 +1629,18 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
                 session_id,
                 extracted.get("business_niche") or "не определено",
                 extracted.get("tariff_interest") or "не определено",
-                extracted.get("intent_summary"),
+                intent_summary,
                 has_lead_new,
-                extracted.get("lead_name"),
-                extracted.get("lead_contact"),
+                local["name"],
+                local["contact"],
             )
         # Fire TG notification on transition false → true
         if has_lead_new and not (sess and sess["lead_notified"]):
             niche = extracted.get("business_niche") or "—"
-            name = extracted.get("lead_name") or "—"
-            contact = extracted.get("lead_contact") or "—"
+            name = local["name"] or "—"
+            contact = local["contact"] or "—"
             tariff = extracted.get("tariff_interest") or "—"
-            summary = extracted.get("intent_summary") or ""
+            summary = intent_summary
             await tg_send(
                 f"🎯 <b>Новый лид с {source}</b>\n\n"
                 f"<b>Имя:</b> {name}\n"
@@ -1650,6 +1719,9 @@ async def chat(request: Request):
     server_messages.append({"role": "user", "content": user_text})
     server_messages = _normalize_history(server_messages)
 
+    # Обезличиваем перед отправкой за рубеж (Anthropic, США): ПД → плейсхолдеры
+    masked_messages, pii_map = _mask_messages(server_messages)
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -1669,7 +1741,7 @@ async def chat(request: Request):
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    "messages": server_messages,
+                    "messages": masked_messages,
                 },
             )
             data = response.json()
@@ -1686,6 +1758,9 @@ async def chat(request: Request):
     if not reply:
         print(f"[chat] empty reply, raw={data}")
         return JSONResponse({"error": "empty reply from model"}, status_code=502)
+
+    # Возвращаем настоящие значения в ответ пользователю (Claude их не видел)
+    reply = _unmask(reply, pii_map)
 
     usage = data.get("usage") or {}
 
