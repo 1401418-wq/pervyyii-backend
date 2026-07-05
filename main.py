@@ -45,7 +45,9 @@ ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
 BUSINESS_BOT_TOKEN = os.environ.get("BUSINESS_BOT_TOKEN", "")
 BUSINESS_WEBHOOK_SECRET = os.environ.get("BUSINESS_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # для авторегистрации webhook
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # для распознавания голосовых через Whisper
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # legacy, больше не используется для голоса
+YC_API_KEY = os.environ.get("YC_API_KEY_SECRET", "")   # Яндекс SpeechKit (РФ) — распознавание голосовых
+YC_FOLDER = os.environ.get("YC_FOLDER_ID", "")
 
 # ─────────────────── Лимиты и защита от абуза ───────────────────
 import time as _time
@@ -1324,8 +1326,8 @@ async def _business_typing(business_connection_id: str, chat_id: int) -> None:
 
 
 async def _transcribe_voice(file_id: str) -> str | None:
-    """Скачать голосовое из Telegram и распознать через OpenAI Whisper. Возвращает текст или None."""
-    if not (BUSINESS_BOT_TOKEN and OPENAI_API_KEY):
+    """Скачать голосовое из Telegram и распознать через Яндекс SpeechKit (РФ). Возвращает текст или None."""
+    if not (BUSINESS_BOT_TOKEN and YC_API_KEY and YC_FOLDER):
         return None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -1344,18 +1346,18 @@ async def _transcribe_voice(file_id: str) -> str | None:
                 print(f"[business] voice download failed: {audio_resp.status_code}")
                 return None
             audio_bytes = audio_resp.content
+        # Telegram voice = OGG Opus; Яндекс STT v1 (короткое аудио, до ~30с) принимает oggopus
         async with httpx.AsyncClient(timeout=60) as client:
-            whisper_resp = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                files={"file": ("voice.oga", audio_bytes, "audio/ogg")},
-                data={"model": "whisper-1", "language": "ru"},
+            stt_resp = await client.post(
+                "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize",
+                params={"folderId": YC_FOLDER, "lang": "ru-RU", "format": "oggopus"},
+                headers={"Authorization": f"Api-Key {YC_API_KEY}"},
+                content=audio_bytes,
             )
-            if whisper_resp.status_code != 200:
-                print(f"[business] whisper failed: {whisper_resp.status_code} {whisper_resp.text[:300]}")
+            if stt_resp.status_code != 200:
+                print(f"[business] yandex stt failed: {stt_resp.status_code} {stt_resp.text[:300]}")
                 return None
-            result = whisper_resp.json()
-            transcript = (result.get("text") or "").strip()
+            transcript = (stt_resp.json().get("result") or "").strip()
             print(f"[business] voice transcribed ({len(audio_bytes)} bytes → {len(transcript)} chars)")
             return transcript or None
     except Exception as e:
