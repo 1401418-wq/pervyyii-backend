@@ -13,7 +13,7 @@ import asyncpg
 import socket
 import ipaddress
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 app = FastAPI()
 
@@ -99,6 +99,23 @@ def _validate_chat_messages(messages) -> str | None:
     if total > MAX_TOTAL_CHARS:
         return "conversation too long"
     return None
+
+
+def _normalize_history(msgs: list) -> list:
+    """Чередование ролей и старт с user — требование Anthropic. Ведущие assistant
+    отбрасываем, соседние одинаковые роли склеиваем."""
+    out: list = []
+    for m in msgs:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        if not out and role != "user":
+            continue
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] = f"{out[-1]['content']}\n\n{m.get('content', '')}"
+        else:
+            out.append({"role": role, "content": m.get("content", "")})
+    return out
 
 SYSTEM = """Ты — ИИ-ассистент компании «Первый ИИ» (pervyyii.ru). Компания создаёт
 и внедряет ИИ-агентов для российского бизнеса. Ты сам — живой пример того,
@@ -1601,9 +1618,14 @@ async def chat(request: Request):
     referrer = body.get("referrer") or ""
     user_agent = request.headers.get("user-agent", "")[:500]
 
-    # Log user message (the last one in history is what they just sent)
-    last_user = messages[-1] if messages else None
-    if pool and last_user and last_user.get("role") == "user":
+    # Доверяем только последнему user-сообщению от клиента; историю диалога берём
+    # с сервера (БД), чтобы нельзя было подделать assistant-реплики (prompt injection).
+    if messages[-1].get("role") != "user":
+        return JSONResponse({"error": "last message must be from user"}, status_code=400)
+    user_text = str(messages[-1].get("content", ""))[:8000]
+
+    server_messages: list = []
+    if pool:
         try:
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -1612,12 +1634,21 @@ async def chat(request: Request):
                        ON CONFLICT (session_id) DO UPDATE SET last_activity_at=NOW()""",
                     session_id, user_agent, referrer[:500], ip[:64],
                 )
+                rows = await conn.fetch(
+                    """SELECT role, content FROM messages
+                       WHERE session_id=$1 ORDER BY created_at DESC LIMIT 40""",
+                    session_id,
+                )
                 await conn.execute(
                     "INSERT INTO messages (session_id, role, content) VALUES ($1, 'user', $2)",
-                    session_id, str(last_user.get("content", ""))[:8000],
+                    session_id, user_text,
                 )
+            server_messages = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
         except Exception as e:
-            print(f"[chat] db log user msg failed: {e}")
+            print(f"[chat] db history/log failed: {e}")
+
+    server_messages.append({"role": "user", "content": user_text})
+    server_messages = _normalize_history(server_messages)
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -1638,7 +1669,7 @@ async def chat(request: Request):
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    "messages": messages,
+                    "messages": server_messages,
                 },
             )
             data = response.json()
@@ -1962,21 +1993,32 @@ def _ip_is_public(ip_str: str) -> bool:
     )
 
 
-async def _host_is_public(host: str) -> bool:
-    """Резолвит хост и требует, чтобы ВСЕ адреса были публичными — анти-SSRF.
-    Остаточный риск DNS-rebinding (резолв тут ≠ резолв httpx при коннекте)
-    вынесен на глубокую проверку Opus."""
+async def _resolve_ips(host: str) -> list[str]:
     try:
         loop = asyncio.get_event_loop()
-        infos = await loop.getaddrinfo(host, None)
+        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except Exception:
-        return False
-    ips = {i[4][0] for i in infos}
+        return []
+    seen: list[str] = []
+    for i in infos:
+        ip = i[4][0]
+        if ip not in seen:
+            seen.append(ip)
+    return seen
+
+
+async def _host_is_public(host: str) -> bool:
+    """Резолвит хост и требует, чтобы ВСЕ адреса были публичными. Быстрый отсев/UX;
+    реальная защита от rebinding — в _safe_fetch (пиннинг на IP)."""
+    ips = await _resolve_ips(host)
     return bool(ips) and all(_ip_is_public(ip) for ip in ips)
 
 
 async def _safe_fetch(url: str, verify: bool, headers: dict, max_redirects: int = 5):
-    """GET с ручным следованием редиректам и проверкой публичности каждого хопа."""
+    """GET с пиннингом на резолвнутый публичный IP — устойчиво к DNS-rebinding.
+    Резолвим хост один раз, проверяем ВСЕ адреса, коннектимся к IP-литералу
+    (второго резолва у httpcore нет → окно rebinding закрыто), Host и SNI
+    сохраняем для корректной проверки TLS-сертификата по имени."""
     current = url
     for _ in range(max_redirects + 1):
         p = urlparse(current)
@@ -1984,12 +2026,21 @@ async def _safe_fetch(url: str, verify: bool, headers: dict, max_redirects: int 
             return None
         if p.port and p.port not in (80, 443):
             return None
-        if not await _host_is_public(p.hostname):
+        ips = await _resolve_ips(p.hostname)
+        if not ips or not all(_ip_is_public(ip) for ip in ips):
             return None
+        ip = ips[0]
+        port = p.port or (443 if p.scheme == "https" else 80)
+        ip_netloc = f"[{ip}]" if ":" in ip else ip
+        ip_url = urlunparse((p.scheme, f"{ip_netloc}:{port}", p.path or "/", p.params, p.query, ""))
+        req_headers = dict(headers)
+        req_headers["Host"] = p.hostname
+        exts = {"sni_hostname": p.hostname} if p.scheme == "https" else {}
         async with httpx.AsyncClient(timeout=20, follow_redirects=False, verify=verify) as client:
-            resp = await client.get(current, headers=headers)
+            req = httpx.Request("GET", ip_url, headers=req_headers, extensions=exts)
+            resp = await client.send(req)
         if resp.status_code in (301, 302, 303, 307, 308) and resp.headers.get("location"):
-            current = str(resp.url.join(resp.headers["location"]))
+            current = str(httpx.URL(current).join(resp.headers["location"]))
             continue
         return resp
     return None
