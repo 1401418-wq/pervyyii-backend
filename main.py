@@ -814,7 +814,7 @@ async def _poll_bot(token: str, path: str, secret: str) -> None:
             async with httpx.AsyncClient(timeout=40) as c:
                 r = await c.get(
                     f"https://api.telegram.org/bot{token}/getUpdates",
-                    params={"offset": offset, "timeout": 25, "allowed_updates": '["message"]'},
+                    params={"offset": offset, "timeout": 25, "allowed_updates": '["message","edited_message","business_connection","business_message","edited_business_message"]'},
                 )
                 updates = r.json().get("result", [])
             for upd in updates:
