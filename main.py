@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import httpx
 import os
 import re
+import html
 import json
 import uuid
 import base64
@@ -61,10 +62,20 @@ MAX_TOTAL_CHARS = 24000
 
 
 def _client_ip(request: Request) -> str:
+    xr = request.headers.get("x-real-ip", "").strip()
+    if xr:
+        return xr
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _safe_err(e) -> str:
+    """Строка ошибки без секретов (токен бота / креды прокси) — для логов."""
+    s = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot<redacted>", str(e))
+    s = re.sub(r"//[^/@\s]+@", "//<redacted>@", s)
+    return s[:300]
 
 
 def _rate_limited(key: str, limit: int = 10, window: int = 3600) -> bool:
@@ -87,7 +98,7 @@ def _rate_limited(key: str, limit: int = 10, window: int = 3600) -> bool:
 # Реальные значения остаются на сервере, ответ обратно un-mask'ается для пользователя.
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _TG_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,}")
-_PHONE_RE = re.compile(r"\+?[78]?[\s\-()]*\d(?:[\s\-()]*\d){9,10}")
+_PHONE_RE = re.compile(r"\+?[78]?[\s\-().]*\d(?:[\s\-().]*\d){9,10}")
 _NAME_RE = re.compile(r"(меня зовут|мо[её] имя|зовут меня)\s+([А-ЯЁ][а-яё]+)", re.I)
 
 
@@ -807,7 +818,7 @@ async def _poll_bot(token: str, path: str, secret: str) -> None:
         async with httpx.AsyncClient(timeout=30) as c:
             await c.post(f"https://api.telegram.org/bot{token}/deleteWebhook")
     except Exception as e:
-        print(f"[poll {path}] deleteWebhook failed: {e}")
+        print(f"[poll {path}] deleteWebhook failed: {_safe_err(e)}")
     offset = 0
     while True:
         try:
@@ -816,7 +827,12 @@ async def _poll_bot(token: str, path: str, secret: str) -> None:
                     f"https://api.telegram.org/bot{token}/getUpdates",
                     params={"offset": offset, "timeout": 25, "allowed_updates": '["message","edited_message","business_connection","business_message","edited_business_message"]'},
                 )
-                updates = r.json().get("result", [])
+                data = r.json()
+            if r.status_code != 200 or not data.get("ok"):
+                print(f"[poll {path}] getUpdates not ok: {r.status_code} {_safe_err(data.get('description', ''))}")
+                await asyncio.sleep(5)
+                continue
+            updates = data.get("result", [])
             for upd in updates:
                 offset = upd["update_id"] + 1
                 # скармливаем существующему webhook-обработчику локально (без трубы)
@@ -824,9 +840,9 @@ async def _poll_bot(token: str, path: str, secret: str) -> None:
                     async with httpx.AsyncClient(timeout=120, trust_env=False) as lc:
                         await lc.post(f"http://127.0.0.1:8000/{path}/webhook/{secret}", json=upd)
                 except Exception as e:
-                    print(f"[poll {path}] handoff failed: {e}")
+                    print(f"[poll {path}] handoff failed: {_safe_err(e)}")
         except Exception as e:
-            print(f"[poll {path}] loop error: {e}")
+            print(f"[poll {path}] loop error: {_safe_err(e)}")
             await asyncio.sleep(3)
 
 
@@ -880,12 +896,18 @@ async def tg_send(text: str) -> None:
         async with httpx.AsyncClient(timeout=10) as client:
             for r in rows:
                 try:
-                    await client.post(
+                    resp = await client.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                         json={"chat_id": r["chat_id"], "text": text, "parse_mode": "HTML"},
                     )
+                    if resp.status_code == 400:
+                        # HTML не распарсился — не теряем уведомление, шлём обычным текстом
+                        await client.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json={"chat_id": r["chat_id"], "text": text},
+                        )
                 except Exception as e:
-                    print(f"[tg] send to {r['chat_id']} failed: {e}")
+                    print(f"[tg] send to {r['chat_id']} failed: {_safe_err(e)}")
     except Exception as e:
         print(f"[tg] tg_send failed: {e}")
 
@@ -1690,11 +1712,11 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
             )
         # Fire TG notification on transition false → true
         if has_lead_new and not (sess and sess["lead_notified"]):
-            niche = extracted.get("business_niche") or "—"
-            name = local["name"] or "—"
-            contact = local["contact"] or "—"
-            tariff = extracted.get("tariff_interest") or "—"
-            summary = intent_summary
+            niche = html.escape(str(extracted.get("business_niche") or "—"))
+            name = html.escape(str(local["name"] or "—"))
+            contact = html.escape(str(local["contact"] or "—"))
+            tariff = html.escape(str(extracted.get("tariff_interest") or "—"))
+            summary = html.escape(str(intent_summary))
             await tg_send(
                 f"🎯 <b>Новый лид с {source}</b>\n\n"
                 f"<b>Имя:</b> {name}\n"
@@ -1800,7 +1822,8 @@ async def chat(request: Request):
             )
             data = response.json()
     except httpx.HTTPError as e:
-        return JSONResponse({"error": f"upstream request failed: {e}"}, status_code=502)
+        print(f"[chat] upstream failed: {e}")
+        return JSONResponse({"error": "upstream request failed"}, status_code=502)
 
     if "error" in data:
         print(f"[chat] upstream error: {data['error']}")
@@ -1960,12 +1983,12 @@ async def broadcast(request: Request):
         raise HTTPException(401, "bad secret")
     payload = await request.json()
     source = (payload.get("source") or "—").lower()
-    source_display = payload.get("source_display") or payload.get("source") or "—"
-    name = payload.get("name") or "—"
-    contact = payload.get("contact") or "—"
-    niche = payload.get("niche") or "—"
-    tariff = payload.get("tariff") or "—"
-    summary = payload.get("summary") or ""
+    source_display = html.escape(str(payload.get("source_display") or payload.get("source") or "—"))
+    name = html.escape(str(payload.get("name") or "—"))
+    contact = html.escape(str(payload.get("contact") or "—"))
+    niche = html.escape(str(payload.get("niche") or "—"))
+    tariff = html.escape(str(payload.get("tariff") or "—"))
+    summary = html.escape(str(payload.get("summary") or ""))
     route = (payload.get("route") or "family").lower()
 
     text = (
@@ -2315,7 +2338,8 @@ async def audit(request: Request):
                 )
                 return response.json(), {}, response.status_code
         except httpx.HTTPError as e:
-            return None, {"error": f"upstream failed: {e}"}, 502
+            print(f"[audit] upstream failed: {e}")
+            return None, {"error": "upstream failed"}, 502
 
     def extract_json(text: str) -> dict | None:
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
