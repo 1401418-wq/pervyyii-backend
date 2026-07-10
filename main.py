@@ -790,6 +790,55 @@ CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts_subscribers(source);
 pool: asyncpg.Pool | None = None
 
 
+# ─────────────── Telegram polling (РФ: webhook от TG режется РКН, опрашиваем сами через трубу) ───────────────
+TELEGRAM_POLLING = os.environ.get("TELEGRAM_POLLING", "") == "1"
+
+_POLL_BOTS = [
+    ("TELEGRAM_BOT_TOKEN", "telegram", "TELEGRAM_WEBHOOK_SECRET"),
+    ("ALERTS_BOT_TOKEN", "alerts", "ALERTS_WEBHOOK_SECRET"),
+    ("DEMO_BOT_TOKEN", "demo", "DEMO_WEBHOOK_SECRET"),
+    ("BUSINESS_BOT_TOKEN", "business", "BUSINESS_WEBHOOK_SECRET"),
+]
+
+
+async def _poll_bot(token: str, path: str, secret: str) -> None:
+    # getUpdates идёт через трубу (HTTPS_PROXY из env); webhook и getUpdates несовместимы → сначала снять webhook
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            await c.post(f"https://api.telegram.org/bot{token}/deleteWebhook")
+    except Exception as e:
+        print(f"[poll {path}] deleteWebhook failed: {e}")
+    offset = 0
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=40) as c:
+                r = await c.get(
+                    f"https://api.telegram.org/bot{token}/getUpdates",
+                    params={"offset": offset, "timeout": 25, "allowed_updates": '["message"]'},
+                )
+                updates = r.json().get("result", [])
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                # скармливаем существующему webhook-обработчику локально (без трубы)
+                try:
+                    async with httpx.AsyncClient(timeout=120, trust_env=False) as lc:
+                        await lc.post(f"http://127.0.0.1:8000/{path}/webhook/{secret}", json=upd)
+                except Exception as e:
+                    print(f"[poll {path}] handoff failed: {e}")
+        except Exception as e:
+            print(f"[poll {path}] loop error: {e}")
+            await asyncio.sleep(3)
+
+
+async def _start_polling() -> None:
+    for tok_name, path, sec_name in _POLL_BOTS:
+        token = os.environ.get(tok_name, "")
+        secret = os.environ.get(sec_name, "")
+        if token and secret:
+            asyncio.create_task(_poll_bot(token, path, secret))
+            print(f"[poll] started for {path}")
+
+
 @app.on_event("startup")
 async def startup() -> None:
     global pool
@@ -801,8 +850,11 @@ async def startup() -> None:
         async with pool.acquire() as conn:
             await conn.execute(SCHEMA_SQL)
         print("[startup] DB pool ready, schema applied")
-        await _register_alerts_webhook()
-        await _register_business_webhook()
+        if TELEGRAM_POLLING:
+            await _start_polling()
+        else:
+            await _register_alerts_webhook()
+            await _register_business_webhook()
     except Exception as e:
         print(f"[startup] DB init failed: {e}")
         pool = None
