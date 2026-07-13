@@ -1,0 +1,61 @@
+-- Схема pervyyii_hub. Применяется под ролью agents при деплое (agent-deploy.sh),
+-- НЕ в рантайме приложения. Идемпотентно (IF NOT EXISTS).
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_activity_at TIMESTAMPTZ DEFAULT NOW(),
+    user_agent TEXT,
+    referrer TEXT,
+    ip TEXT,
+    business_niche TEXT,
+    tariff_interest TEXT,
+    intent_summary TEXT,
+    lead_name TEXT,
+    lead_contact TEXT,
+    has_lead BOOLEAN DEFAULT FALSE,
+    lead_notified BOOLEAN DEFAULT FALSE,
+    msg_count INTEGER DEFAULT 0,
+    last_extracted_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS telegram_subscribers (
+    chat_id BIGINT PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    subscribed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS alerts_subscribers (
+    chat_id BIGINT NOT NULL,
+    source TEXT NOT NULL,
+    username TEXT,
+    first_name TEXT,
+    subscribed_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (chat_id, source)
+);
+
+CREATE TABLE IF NOT EXISTS business_connections (
+    user_chat_id BIGINT PRIMARY KEY,
+    business_connection_id TEXT NOT NULL,
+    username TEXT,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    can_reply BOOLEAN DEFAULT TRUE,
+    connected_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_lead ON sessions(has_lead) WHERE has_lead = TRUE;
+CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts_subscribers(source);
