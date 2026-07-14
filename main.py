@@ -2459,13 +2459,9 @@ async def agent_page():
 
 @app.get("/agent-primetent.html")
 async def agent_primetent_page():
-    return FileResponse(
-        "agent-primetent.html",
-        headers={
-            "Content-Security-Policy":
-                "frame-ancestors 'self' https://prime-tent.ru https://www.prime-tent.ru"
-        },
-    )
+    # frame-ancestors управляется централизованно в nginx (per-client allowlist).
+    # Для установки на prime-tent.ru добавить домен в nginx CSP.
+    return FileResponse("agent-primetent.html")
 
 
 @app.get("/embed-primetent.js")
