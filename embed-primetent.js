@@ -13,15 +13,15 @@
 
   var style = document.createElement("style");
   style.textContent = [
-    "#pt-chat-button{position:fixed;right:24px;bottom:24px;height:56px;border-radius:28px;",
-    "background:#2f7fd1;color:#fff;border:none;cursor:pointer;white-space:nowrap;",
-    "box-shadow:0 10px 30px rgba(0,0,0,.3);display:flex;align-items:center;gap:10px;padding:0 24px;",
-    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;font-size:15px;font-weight:600;line-height:1;",
-    "z-index:2147483646;transition:transform .15s ease;animation:pt-pulse 2.6s ease-in-out infinite}",
+    "#pt-chat-button{position:fixed;right:24px;bottom:24px;",
+    "background:#d13b30;color:#fff;border:0;cursor:pointer;white-space:nowrap;",
+    "display:flex;align-items:center;gap:12px;padding:9px 22px 9px 9px;border-radius:44px;",
+    "font-family:var(--disp,'Oswald','Arial Narrow',sans-serif);text-transform:uppercase;letter-spacing:.05em;font-weight:600;font-size:15px;line-height:1;",
+    "box-shadow:0 8px 26px rgba(209,59,48,.5);z-index:2147483646;transition:transform .15s ease;animation:pt-pulse 2.6s ease-in-out infinite}",
     "#pt-chat-button:hover{transform:translateY(-2px)}",
-    "#pt-chat-button svg{width:22px;height:22px;display:block;flex:none}",
-    "@keyframes pt-pulse{0%,100%{box-shadow:0 10px 30px rgba(0,0,0,.3),0 0 0 0 rgba(47,127,209,.55)}",
-    "50%{box-shadow:0 10px 30px rgba(0,0,0,.3),0 0 0 15px rgba(47,127,209,0)}}",
+    "#pt-chat-button img{height:36px;width:auto;border-radius:8px;background:#fff;padding:4px 5px;box-shadow:0 2px 8px rgba(0,0,0,.25);flex:0 0 auto;display:block}",
+    "@keyframes pt-pulse{0%,100%{box-shadow:0 8px 26px rgba(209,59,48,.5),0 0 0 0 rgba(209,59,48,.5)}",
+    "50%{box-shadow:0 8px 26px rgba(209,59,48,.5),0 0 0 16px rgba(209,59,48,0)}}",
     "#pt-chat-window{position:fixed;right:24px;bottom:96px;width:384px;height:568px;",
     "max-height:calc(100vh - 128px);background:#fff;border-radius:14px;",
     "box-shadow:0 24px 60px rgba(0,0,0,.26);overflow:hidden;z-index:2147483645;",
@@ -30,7 +30,7 @@
     "#pt-chat-window.open{transform:translateY(0) scale(1);opacity:1;pointer-events:auto}",
     "#pt-chat-window iframe{width:100%;height:100%;border:0;display:block}",
     "@media (max-width:480px){#pt-chat-window{right:12px;left:12px;width:auto;bottom:88px}",
-    "#pt-chat-button{right:16px;bottom:16px;height:52px;padding:0 20px;font-size:14px}}",
+    "#pt-chat-button{right:16px;bottom:16px;padding:8px 18px 8px 8px;font-size:14px}}",
   ].join("");
   document.head.appendChild(style);
 
@@ -38,9 +38,8 @@
   btn.id = "pt-chat-button";
   btn.setAttribute("aria-label", "Задать вопрос помощнику");
   btn.innerHTML =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-    '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>' +
-    "</svg><span>Задать вопрос</span>";
+    '<img src="https://prime-tent.ru/assets/logo_prime_tent.gif" alt="">' +
+    "<span>Задать вопрос</span>";
 
   var win = document.createElement("div");
   win.id = "pt-chat-window";
