@@ -1218,7 +1218,7 @@ async def demo_webhook(secret: str, request: Request):
                 "UPDATE sessions SET msg_count = msg_count + 2, last_activity_at = NOW() WHERE session_id=$1",
                 session_id,
             )
-        asyncio.create_task(extract_metadata(session_id, source="Telegram-демо-бота"))
+        asyncio.create_task(extract_metadata(session_id, "demo"))
     except Exception as e:
         print(f"[demo] db post-call failed: {e}")
 
@@ -1569,7 +1569,7 @@ async def business_webhook(secret: str, request: Request):
                 "UPDATE sessions SET msg_count = msg_count + 2, last_activity_at = NOW() WHERE session_id=$1",
                 session_id,
             )
-        asyncio.create_task(extract_metadata(session_id, source="Telegram-Business @First01_AI"))
+        asyncio.create_task(extract_metadata(session_id, "business"))
     except Exception as e:
         print(f"[business] db post-call failed: {e}")
 
@@ -1591,11 +1591,75 @@ EXTRACTION_SYSTEM = """Ты обрабатываешь диалог посети
 }"""
 
 
-async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None:
+# ─────────────────── Клиенты (мультитенант) ───────────────────
+
+PRIMETENT_EXTRACTION = """Ты обрабатываешь диалог посетителя сайта тентовой компании ПРАЙМ-ТЕНТ с ИИ-помощником. Контактные данные вырезаны и заменены плейсхолдерами вида [NAME_1], [PHONE_2] — не угадывай их.
+
+Извлеки структурированные данные. Верни СТРОГО валидный JSON, без markdown:
+{
+  "construction_type": "тип конструкции (шатёр, ангар, воздухоопорное, цирк-шапито, зонт, павильон, навес и т.п.) или 'не определено'",
+  "size_city": "примерный размер/площадь и город, если названы, иначе 'не указаны'",
+  "intent_summary": "1-2 предложения: что человек спрашивал и чего хочет"
+}"""
+
+
+def _read_client_file(*parts) -> str:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), *parts)
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+try:
+    PRIMETENT_SYSTEM = (
+        _read_client_file("clients", "prime-tent", "system.txt")
+        + "\n\n===== БАЗА ЗНАНИЙ О КОМПАНИИ ПРАЙМ-ТЕНТ =====\n"
+        + _read_client_file("clients", "prime-tent", "kb.txt")
+    )
+except Exception as e:
+    print(f"[clients] prime-tent load failed: {e}")
+    PRIMETENT_SYSTEM = None
+
+# Реестр клиентов. alerts_source=None → tg_send (лиды студии); иначе → alerts_send(source) с изоляцией по источнику.
+CLIENTS = {
+    "pervyyii": {
+        "system": SYSTEM,
+        "extraction": EXTRACTION_SYSTEM,
+        "alerts_source": None,
+        "lead_label": "pervyyii.ru",
+        "kind": "pervyyii",
+    },
+    "prime-tent": {
+        "system": PRIMETENT_SYSTEM,
+        "extraction": PRIMETENT_EXTRACTION,
+        "alerts_source": "prime-tent",
+        "lead_label": "ПРАЙМ-ТЕНТ",
+        "kind": "prime-tent",
+    },
+    # Собственные каналы студии — только для лейбла уведомления (chat идёт своими промптами).
+    "demo": {
+        "system": SYSTEM, "extraction": EXTRACTION_SYSTEM,
+        "alerts_source": None, "lead_label": "Telegram-демо-бота", "kind": "pervyyii",
+    },
+    "business": {
+        "system": SYSTEM, "extraction": EXTRACTION_SYSTEM,
+        "alerts_source": None, "lead_label": "Telegram-Business @First01_AI", "kind": "pervyyii",
+    },
+}
+
+
+def _get_client(name: str) -> dict:
+    cfg = CLIENTS.get((name or "").strip().lower())
+    if not cfg or not cfg.get("system"):
+        return CLIENTS["pervyyii"]
+    return cfg
+
+
+async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> None:
     """Background: read transcript, ask LLM for structured fields, update sessions row.
-    Also fires Telegram notification on first lead detection. `source` is shown in the TG message."""
+    Fires a lead notification on first lead detection, routed per client."""
     if not (pool and ANTHROPIC_API_KEY):
         return
+    cfg = _get_client(client_name)
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -1603,7 +1667,7 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
                 session_id,
             )
             sess = await conn.fetchrow(
-                "SELECT has_lead, lead_notified FROM sessions WHERE session_id=$1",
+                "SELECT has_lead, lead_notified, referrer FROM sessions WHERE session_id=$1",
                 session_id,
             )
         if not rows:
@@ -1626,7 +1690,7 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
                 json={
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 400,
-                    "system": EXTRACTION_SYSTEM,
+                    "system": cfg["extraction"],
                     "messages": [{"role": "user", "content": masked_transcript}],
                 },
             )
@@ -1637,6 +1701,12 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
             text = text.strip("`").lstrip("json").strip()
         extracted = json.loads(text)
         intent_summary = _unmask(extracted.get("intent_summary") or "", emap)
+        if cfg["kind"] == "prime-tent":
+            field_a = extracted.get("construction_type") or "не определено"
+            field_b = extracted.get("size_city") or "не указаны"
+        else:
+            field_a = extracted.get("business_niche") or "не определено"
+            field_b = extracted.get("tariff_interest") or "не определено"
         async with pool.acquire() as conn:
             await conn.execute(
                 """UPDATE sessions SET
@@ -1644,28 +1714,37 @@ async def extract_metadata(session_id: str, source: str = "pervyyii.ru") -> None
                     has_lead=$5, lead_name=$6, lead_contact=$7, last_extracted_at=NOW()
                    WHERE session_id=$1""",
                 session_id,
-                extracted.get("business_niche") or "не определено",
-                extracted.get("tariff_interest") or "не определено",
-                intent_summary,
+                field_a, field_b, intent_summary,
                 has_lead_new,
                 local["name"],
                 local["contact"],
             )
-        # Fire TG notification on transition false → true
+        # Fire lead notification on transition false → true, routed per client
         if has_lead_new and not (sess and sess["lead_notified"]):
-            niche = html.escape(str(extracted.get("business_niche") or "—"))
             name = html.escape(str(local["name"] or "—"))
             contact = html.escape(str(local["contact"] or "—"))
-            tariff = html.escape(str(extracted.get("tariff_interest") or "—"))
             summary = html.escape(str(intent_summary))
-            await tg_send(
-                f"🎯 <b>Новый лид с {source}</b>\n\n"
-                f"<b>Имя:</b> {name}\n"
-                f"<b>Контакт:</b> {contact}\n"
-                f"<b>Сфера:</b> {niche}\n"
-                f"<b>Интерес к тарифу:</b> {tariff}\n\n"
-                f"<i>{summary}</i>"
-            )
+            page = html.escape(str((sess and sess["referrer"]) or "—"))[:300]
+            if cfg["kind"] == "prime-tent":
+                await alerts_send(
+                    cfg["alerts_source"],
+                    f"🎯 <b>Новая заявка — ПРАЙМ-ТЕНТ</b>\n\n"
+                    f"<b>Имя:</b> {name}\n"
+                    f"<b>Контакт:</b> {contact}\n"
+                    f"<b>Конструкция:</b> {html.escape(str(field_a))}\n"
+                    f"<b>Размер/город:</b> {html.escape(str(field_b))}\n"
+                    f"<b>Страница:</b> {page}\n\n"
+                    f"<i>{summary}</i>"
+                )
+            else:
+                await tg_send(
+                    f"🎯 <b>Новый лид с {cfg['lead_label']}</b>\n\n"
+                    f"<b>Имя:</b> {name}\n"
+                    f"<b>Контакт:</b> {contact}\n"
+                    f"<b>Сфера:</b> {html.escape(str(field_a))}\n"
+                    f"<b>Интерес к тарифу:</b> {html.escape(str(field_b))}\n\n"
+                    f"<i>{summary}</i>"
+                )
             async with pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE sessions SET lead_notified=TRUE WHERE session_id=$1", session_id
@@ -1703,6 +1782,8 @@ async def chat(request: Request):
     session_id = body.get("session_id") or str(uuid.uuid4())
     referrer = body.get("referrer") or ""
     user_agent = request.headers.get("user-agent", "")[:500]
+    client_name = str(body.get("client") or "pervyyii")[:32]
+    client_cfg = _get_client(client_name)
 
     # Доверяем только последнему user-сообщению от клиента; историю диалога берём
     # с сервера (БД), чтобы нельзя было подделать assistant-реплики (prompt injection).
@@ -1754,7 +1835,7 @@ async def chat(request: Request):
                     "system": [
                         {
                             "type": "text",
-                            "text": SYSTEM,
+                            "text": client_cfg["system"],
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
@@ -1799,7 +1880,7 @@ async def chat(request: Request):
                        WHERE session_id=$1""",
                     session_id,
                 )
-            asyncio.create_task(extract_metadata(session_id))
+            asyncio.create_task(extract_metadata(session_id, client_name))
         except Exception as e:
             print(f"[chat] db log assistant msg failed: {e}")
 
@@ -2346,3 +2427,13 @@ async def health():
 @app.get("/agent.html")
 async def agent_page():
     return FileResponse("agent.html")
+
+
+@app.get("/agent-primetent.html")
+async def agent_primetent_page():
+    return FileResponse("agent-primetent.html")
+
+
+@app.get("/embed-primetent.js")
+async def embed_primetent_js():
+    return FileResponse("embed-primetent.js", media_type="application/javascript")
