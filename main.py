@@ -1817,7 +1817,7 @@ async def chat(request: Request):
         return JSONResponse({"error": err}, status_code=400)
 
     ip = _client_ip(request)
-    client_name = str(body.get("client") or "pervyyii")[:32]
+    client_name = str(body.get("client") or "pervyyii")[:32].strip().lower()
     client_cfg = _get_client(client_name)
 
     # CSRF/абьюз: браузерный виджет ходит с Origin нашего домена; чужой браузерный origin отсекаем.
