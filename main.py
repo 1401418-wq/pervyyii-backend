@@ -114,6 +114,16 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _TG_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,}")
 _PHONE_RE = re.compile(r"\+?[78]?[\s\-().]*\d(?:[\s\-().]*\d){9,10}")
 _NAME_RE = re.compile(r"(меня зовут|мо[её] имя|зовут меня)\s+([А-ЯЁ][а-яё]+)", re.I)
+# Документы/реквизиты (цифровые — ловятся надёжно; типовые размеры/цены ≤7-8 цифр не задеваются)
+_PASSPORT_RE = re.compile(r"(?<!\d)\d{4}\s\d{6}(?!\d)")                 # паспорт: серия+номер
+_CARDACCT_RE = re.compile(r"(?<!\d)\d{4}(?:[ \-]\d{4}){2,4}(?!\d)")     # карта/счёт группами по 4
+_DOCNUM_RE = re.compile(r"(?<!\d)\d{10,20}(?!\d)")                      # ИНН/счёт/карта слитно
+# Адрес: требуем номер дома, чтобы не рвать обычный текст («на улице тепло» не сматчится)
+_ADDR_RE = re.compile(
+    r"(?:ул\.?|улиц\w+|проспект\w*|пр-т|переул\w*|пер\.|шоссе|бульвар\w*|наб\.|набережн\w+|мкр\.?|микрорайон)"
+    r"[\s,]+[A-Za-zА-ЯЁа-яё0-9\-. ]{2,30}?,?\s*(?:д\.?\s*)?\d+[а-яА-Я]?",
+    re.I,
+)
 
 
 def _mask_pii(text: str, mapping: dict) -> str:
@@ -130,6 +140,11 @@ def _mask_pii(text: str, mapping: dict) -> str:
 
     text = _EMAIL_RE.sub(lambda m: _ph("EMAIL", m.group(0)), text)
     text = _TG_RE.sub(lambda m: _ph("TG", m.group(0)), text)
+    text = _ADDR_RE.sub(lambda m: _ph("ADDR", m.group(0)), text)
+    text = _PASSPORT_RE.sub(lambda m: _ph("DOC", m.group(0)), text)
+    text = _CARDACCT_RE.sub(lambda m: _ph("DOC", m.group(0)), text)
+    # Документы-слитно ДО телефона: иначе телефонный regex откусывает часть длинного числа и остаток утекает
+    text = _DOCNUM_RE.sub(lambda m: _ph("DOC", m.group(0)), text)
     text = _PHONE_RE.sub(lambda m: _ph("PHONE", m.group(0)), text)
     text = _NAME_RE.sub(lambda m: m.group(1) + " " + _ph("NAME", m.group(2)), text)
     return text
