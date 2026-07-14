@@ -1860,6 +1860,8 @@ async def chat(request: Request):
 
     # Возвращаем настоящие значения в ответ пользователю (Claude их не видел)
     reply = _unmask(reply, pii_map)
+    # Чистим markdown/эмодзи для всех web-виджетов (виджеты выводят textContent — звёздочки видны как есть)
+    reply = _strip_md(reply)
 
     usage = data.get("usage") or {}
 
