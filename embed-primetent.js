@@ -52,7 +52,9 @@
   var loaded = false;
   btn.addEventListener("click", function () {
     if (!loaded) {
-      iframe.src = ORIGIN + "/agent-primetent.html?ref=" + encodeURIComponent(location.href);
+      // источник: только origin+pathname, без query/fragment/userinfo (сервер валидирует повторно)
+      var ref = (location.origin + location.pathname).slice(0, 300);
+      iframe.src = ORIGIN + "/agent-primetent.html?ref=" + encodeURIComponent(ref);
       loaded = true;
     }
     win.classList.toggle("open");

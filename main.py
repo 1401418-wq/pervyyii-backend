@@ -93,6 +93,20 @@ def _rate_limited(key: str, limit: int = 10, window: int = 3600) -> bool:
     return False
 
 
+# Разрешённые Origin для браузерного потока /chat (виджеты живут на нашем домене).
+_ALLOWED_CHAT_ORIGINS = {"https://pervyyii.ru", "https://www.pervyyii.ru"}
+
+
+def _sanitize_referrer(ref: str) -> str:
+    """Метка источника: только https?://host/path — без query/fragment/userinfo, с лимитом длины."""
+    if not ref:
+        return ""
+    m = re.match(r"^https?://(?:[^/@?#\s]*@)?([^/:?#\s]+)(?::\d+)?(/[^?#\s]*)?", ref.strip())
+    if not m:
+        return ""
+    return (m.group(1) + (m.group(2) or "/"))[:200]
+
+
 # ─────────────────── Обезличивание ПД перед отправкой за рубеж (152-ФЗ) ───────────────────
 # За границу (Anthropic/OpenAI) уходит только текст с плейсхолдерами вместо ПД.
 # Реальные значения остаются на сервере, ответ обратно un-mask'ается для пользователя.
@@ -1773,17 +1787,29 @@ async def chat(request: Request):
         return JSONResponse({"error": err}, status_code=400)
 
     ip = _client_ip(request)
+    client_name = str(body.get("client") or "pervyyii")[:32]
+    client_cfg = _get_client(client_name)
+
+    # CSRF/абьюз: браузерный виджет ходит с Origin нашего домена; чужой браузерный origin отсекаем.
+    # Прямые запросы без Origin (curl и т.п.) держат rate-лимиты ниже.
+    origin = request.headers.get("origin", "")
+    if origin and origin not in _ALLOWED_CHAT_ORIGINS:
+        return JSONResponse({"error": "forbidden origin"}, status_code=403)
+
     if ip not in ("127.0.0.1", "::1", "localhost", "unknown"):
-        if _rate_limited(f"chat:{ip}", limit=60, window=3600):
+        # лимит на одного посетителя одного клиента
+        if _rate_limited(f"chat:{client_name}:{ip}", limit=60, window=3600):
             return JSONResponse({"error": "Слишком много запросов. Попробуйте позже."}, status_code=429)
-    if _rate_limited("chat:_global", limit=300, window=60):
+    # лимит на клиента: флуд по одному клиенту не должен ронять остальных
+    if _rate_limited(f"chat:client:{client_name}", limit=300, window=60):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте через минуту."}, status_code=429)
+    # общий аварийный потолок ноды
+    if _rate_limited("chat:_global", limit=1000, window=60):
         return JSONResponse({"error": "Сервис перегружен, попробуйте через минуту."}, status_code=429)
 
     session_id = body.get("session_id") or str(uuid.uuid4())
-    referrer = body.get("referrer") or ""
+    referrer = _sanitize_referrer(body.get("referrer") or "")
     user_agent = request.headers.get("user-agent", "")[:500]
-    client_name = str(body.get("client") or "pervyyii")[:32]
-    client_cfg = _get_client(client_name)
 
     # Доверяем только последнему user-сообщению от клиента; историю диалога берём
     # с сервера (БД), чтобы нельзя было подделать assistant-реплики (prompt injection).
@@ -2433,7 +2459,13 @@ async def agent_page():
 
 @app.get("/agent-primetent.html")
 async def agent_primetent_page():
-    return FileResponse("agent-primetent.html")
+    return FileResponse(
+        "agent-primetent.html",
+        headers={
+            "Content-Security-Policy":
+                "frame-ancestors 'self' https://prime-tent.ru https://www.prime-tent.ru"
+        },
+    )
 
 
 @app.get("/embed-primetent.js")
