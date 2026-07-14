@@ -107,6 +107,21 @@ def _sanitize_referrer(ref: str) -> str:
     return (m.group(1) + (m.group(2) or "/"))[:200]
 
 
+_CLIENT_REF_HOSTS = {
+    "prime-tent": {"prime-tent.ru", "www.prime-tent.ru"},
+    "pervyyii": {"pervyyii.ru", "www.pervyyii.ru"},
+}
+
+
+def _client_ref_allowed(client: str, referrer: str) -> bool:
+    """Не даём публичному client-параметру выбирать чужую конфигурацию."""
+    if not referrer:
+        return True  # прямые/служебные запросы остаются под rate-limit
+    host = referrer.split("/", 1)[0].lower().rstrip(".")
+    allowed = _CLIENT_REF_HOSTS.get(client)
+    return allowed is None or host in allowed
+
+
 # ─────────────────── Обезличивание ПД перед отправкой за рубеж (152-ФЗ) ───────────────────
 # За границу (Anthropic/OpenAI) уходит только текст с плейсхолдерами вместо ПД.
 # Реальные значения остаются на сервере, ответ обратно un-mask'ается для пользователя.
@@ -1824,6 +1839,8 @@ async def chat(request: Request):
 
     session_id = body.get("session_id") or str(uuid.uuid4())
     referrer = _sanitize_referrer(body.get("referrer") or "")
+    if not _client_ref_allowed(client_name, referrer):
+        return JSONResponse({"error": "client/referrer mismatch"}, status_code=403)
     user_agent = request.headers.get("user-agent", "")[:500]
 
     # Доверяем только последнему user-сообщению от клиента; историю диалога берём
