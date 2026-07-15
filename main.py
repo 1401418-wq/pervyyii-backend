@@ -789,6 +789,7 @@ DEMO_SYSTEM = """Ты — Telegram-бот @pervyyii_demo_bot. Живая дем�
 
 
 pool: asyncpg.Pool | None = None
+_email_retry_task: asyncio.Task | None = None
 
 
 # ─────────────── Telegram polling (РФ: webhook от TG режется РКН, опрашиваем сами через трубу) ───────────────
@@ -847,7 +848,7 @@ async def _start_polling() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global pool
+    global pool, _email_retry_task
     if not DATABASE_URL:
         print("[startup] DATABASE_URL not set — analytics disabled")
         return
@@ -856,6 +857,7 @@ async def startup() -> None:
         async with pool.acquire() as conn:
             await conn.execute("SELECT 1")  # проверка коннекта; схему применяет деплой под agents
         print("[startup] DB pool ready")
+        _email_retry_task = asyncio.create_task(_prime_email_retry_loop())
         if TELEGRAM_POLLING:
             await _start_polling()
         else:
@@ -868,6 +870,14 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    global _email_retry_task
+    if _email_retry_task:
+        _email_retry_task.cancel()
+        try:
+            await _email_retry_task
+        except asyncio.CancelledError:
+            pass
+        _email_retry_task = None
     if pool:
         await pool.close()
 
@@ -1030,14 +1040,66 @@ def _send_email_sync(to_addrs, subject, body):
         s.send_message(msg)
 
 
-async def send_lead_email(to_addrs, subject, body) -> None:
-    """Отправка заявки на почту клиента. Fire-and-forget, не роняет."""
+async def send_lead_email(to_addrs, subject, body) -> bool:
+    """Отправка заявки на почту клиента в фоне; возвращает факт SMTP-успеха."""
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and to_addrs):
-        return
+        return False
     try:
         await asyncio.to_thread(_send_email_sync, to_addrs, subject, body)
+        return True
     except Exception as e:
         print(f"[email] send failed: {_safe_err(e)}")
+        return False
+
+
+def _prime_email_body(row) -> str:
+    return (
+        "Новая заявка с сайта prime-tent.ru\n\n"
+        f"Имя: {row['lead_name'] or '—'}\n"
+        f"Контакт: {row['lead_contact'] or '—'}\n"
+        f"Конструкция: {row['business_niche'] or 'не определено'}\n"
+        f"Размер/город: {row['tariff_interest'] or 'не указаны'}\n"
+        f"Страница: {row['referrer'] or '—'}\n\n"
+        f"{row['intent_summary'] or ''}\n\n"
+        "— Отправлено ИИ-помощником ПРАЙМ-ТЕНТ"
+    )
+
+
+async def _prime_email_retry_loop() -> None:
+    while True:
+        try:
+            if pool and SMTP_HOST and SMTP_USER and SMTP_PASS:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """SELECT session_id, lead_name, lead_contact, business_niche,
+                                  tariff_interest, intent_summary, referrer
+                           FROM sessions
+                           WHERE has_lead=TRUE AND email_notified=FALSE
+                             AND referrer LIKE 'prime-tent.ru/%'
+                           ORDER BY created_at LIMIT 20"""
+                    )
+                for row in rows:
+                    ok = await send_lead_email(
+                        ["tent@prime-tent.ru"],
+                        "Новая заявка с сайта — ПРАЙМ-ТЕНТ",
+                        _prime_email_body(row),
+                    )
+                    async with pool.acquire() as conn:
+                        if ok:
+                            await conn.execute(
+                                "UPDATE sessions SET email_notified=TRUE, email_last_error=NULL WHERE session_id=$1",
+                                row["session_id"],
+                            )
+                        else:
+                            await conn.execute(
+                                "UPDATE sessions SET email_last_error='SMTP delivery failed' WHERE session_id=$1",
+                                row["session_id"],
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[email] retry loop failed: {type(e).__name__}: {_safe_err(e)}")
+        await asyncio.sleep(60)
 
 
 @app.post("/alerts/webhook/{secret}")
@@ -1984,17 +2046,20 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                 )
                 lead_email = cfg.get("lead_email")
                 if lead_email:
-                    email_body = (
-                        "Новая заявка с сайта prime-tent.ru\n\n"
-                        f"Имя: {local['name'] or '—'}\n"
-                        f"Контакт: {local['contact'] or '—'}\n"
-                        f"Конструкция: {field_a}\n"
-                        f"Размер/город: {field_b}\n"
-                        f"Страница: {(sess and sess['referrer']) or '—'}\n\n"
-                        f"{intent_summary}\n\n"
-                        "— Отправлено ИИ-помощником ПРАЙМ-ТЕНТ"
+                    ok = await send_lead_email(
+                        lead_email,
+                        "Новая заявка с сайта — ПРАЙМ-ТЕНТ",
+                        _prime_email_body({
+                            "lead_name": local["name"], "lead_contact": local["contact"],
+                            "business_niche": field_a, "tariff_interest": field_b,
+                            "referrer": (sess and sess["referrer"]), "intent_summary": intent_summary,
+                        }),
                     )
-                    await send_lead_email(lead_email, "Новая заявка с сайта — ПРАЙМ-ТЕНТ", email_body)
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE sessions SET email_notified=$2, email_last_error=$3 WHERE session_id=$1",
+                            session_id, ok, None if ok else "SMTP delivery failed",
+                        )
             else:
                 await tg_send(
                     f"🎯 <b>Новый лид с {cfg['lead_label']}</b>\n\n"
