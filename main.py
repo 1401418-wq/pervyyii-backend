@@ -1741,7 +1741,7 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
     shade_area = _num(shade_area, 1, 100000)
     dome_diameter = _num(dome_diameter, 1, 100)
     _seats = _num(seats, 1, 100000)
-    seats = int(_seats) if _seats is not None else None
+    seats = int(_seats) if (_seats is not None and _seats.is_integer()) else None
 
     def _area():
         if area:
@@ -2081,7 +2081,10 @@ async def chat(request: Request):
     if not isinstance(data, dict) or "error" in data:
         err = data.get("error") if isinstance(data, dict) else data
         print(f"[chat] upstream error: {err}")
-        return JSONResponse({"error": "upstream error"}, status_code=(response.status_code if response is not None else 500))
+        status = response.status_code if response is not None else 502
+        if status < 400:
+            status = 502
+        return JSONResponse({"error": "upstream error"}, status_code=status)
 
     content = data.get("content")
     if not isinstance(content, list):
