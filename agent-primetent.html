@@ -91,7 +91,7 @@
 <body>
 
 <div class="header">
-  <div class="avatar">ПТ</div>
+  <div class="avatar">ИИ</div>
   <div class="header-info">
     <h1>Помощник ПРАЙМ-ТЕНТ</h1>
     <p>Отвечу по тентовым сооружениям</p>
@@ -99,7 +99,7 @@
 </div>
 
 <div class="messages" id="messages">
-  <div class="message bot">Здравствуйте! Я помощник компании ПРАЙМ-ТЕНТ. Подскажу по нашим тентовым сооружениям — шатрам, ангарам, цирковым и другим конструкциям — и помогу с ориентировочным расчётом. Что вас интересует?</div>
+  <div class="message bot">Здравствуйте! Я ИИ-помощник компании ПРАЙМ-ТЕНТ. Готов немедленно помочь Вам в выборе нашей продукции, ответить на все вопросы по ней и сделать предварительный расчёт интересующего Вас тентового сооружения.</div>
 </div>
 
 <div class="consent">
@@ -150,7 +150,14 @@
     div.className = "message " + who;
     div.textContent = text;
     messagesEl.appendChild(div);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (who === "bot") {
+      // длинный ответ показываем с НАЧАЛА, а не с конца — верх сообщения к верху окна
+      const mRect = messagesEl.getBoundingClientRect();
+      const dRect = div.getBoundingClientRect();
+      messagesEl.scrollTop += (dRect.top - mRect.top) - 8;
+    } else {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
   }
   function showTyping() {
     const div = document.createElement("div");
