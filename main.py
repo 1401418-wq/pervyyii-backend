@@ -1823,17 +1823,25 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub_range(s * 7500, s * 10000)} рублей за само сооружение. Стен у гипаров не бывает. {_PT_SEP_GIPAR}"}
 
     if c == "circus":
+        max_seats = _CIRCUS_SEATS[-1][2]
         d = dome_diameter
         if seats and not d:
+            if seats > max_seats:
+                return {"ok": False, "need": f"наши модели купола (24–48 м) вмещают примерно до {max_seats} мест; для большего — расчёт менеджера"}
             d = _circus_diameter_for_seats(seats)
         parts = []
         if d:
             parts.append(f"купол Ø{int(round(d))} м с опорными конструкциями — порядка {_rub((d * d * 3.14 / 4) * 16500)} рублей")
         if seats:
+            if d:
+                _, sh = _circus_seats_for_diameter(d)
+                if seats > sh:
+                    return {"ok": False, "need": f"купол Ø{int(round(d))} м вмещает примерно до {sh} мест — для {seats} мест нужен купол большего диаметра; уточни диаметр купола или число мест"}
             parts.append(f"трибуны на {seats} мест — порядка {_rub(seats * 6500)} рублей")
         elif d:
             sl, sh = _circus_seats_for_diameter(d)
-            parts.append(f"трибуны примерно на {sl}–{sh} мест — порядка {_rub_range(sl * 6500, sh * 6500)} рублей")
+            seats_str = f"{sl}" if sl == sh else f"{sl}–{sh}"
+            parts.append(f"трибуны примерно на {seats_str} мест — порядка {_rub_range(sl * 6500, sh * 6500)} рублей")
         if not parts:
             return {"ok": False, "need": "диаметр купола или желаемая вместимость зала"}
         return {"ok": True, "text": "Ориентир по цирку (называй суммы РАЗДЕЛЬНО, ставки и расчёт НЕ раскрывай): " + "; ".join(parts) + ". Барьер манежа, писта, полы, доп. шатры и прочая комплектация — отдельно. Итоговая вилка в пределах примерно 3 млн зависит от материала купола, типа опор и обработки металла."}
