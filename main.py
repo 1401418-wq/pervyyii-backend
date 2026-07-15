@@ -1698,6 +1698,118 @@ def _get_client(name: str) -> dict:
     return cfg
 
 
+# ─── Prime-Tent: серверный расчёт цены. LLM не считает сам — вызывает calculate_price. ───
+def _rub(x: float) -> str:
+    if x >= 1_000_000:
+        v = round(x / 100_000) / 10.0
+        return f"{v:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " млн"
+    return f"{int(round(x / 25_000) * 25)} тыс"
+
+
+def _rub_range(lo: float, hi: float) -> str:
+    if abs(hi - lo) < 1:
+        return _rub(lo)
+    slo, shi = _rub(lo), _rub(hi)
+    for unit in (" млн", " тыс"):
+        if slo.endswith(unit) and shi.endswith(unit):
+            return slo[: -len(unit)] + "–" + shi
+    return f"{slo}–{shi}"
+
+
+_PT_SEP_ANGAR = "Отдельно менеджер считает: ворота, фундамент/основание, доставку, командировочные."
+_PT_SEP_SHATER = "Отдельно считаются: монтаж, доставка, фундамент/основание."
+_PT_SEP_GIPAR = "Отдельно считаются: монтаж, доставка, фундаменты (сваи под стойки и закладные оттяжек)."
+_PT_SEP_VOZDUH = "Отдельно считаются: доставка, командировочные, фундамент."
+
+
+def pt_calculate_price(construction=None, width=None, length=None, wall_height=None,
+                       area=None, with_walls=False, shade_area=None,
+                       dome_diameter=None, seats=None, **_):
+    def _area():
+        if area:
+            return float(area)
+        if width and length:
+            return float(width) * float(length)
+        return None
+
+    def _perim():
+        if width and length:
+            return 2.0 * (float(width) + float(length))
+        return None
+
+    c = construction
+    if c in ("angar_cold", "angar_warm"):
+        a, pm = _area(), _perim()
+        if not (a and pm and wall_height):
+            return {"ok": False, "need": "ширина, длина и высота стен ангара"}
+        base = a * 8000 + 90000 + pm * float(wall_height) * 1500
+        if c == "angar_warm":
+            base *= 1.35
+        total = base * 1.40
+        kind = "утеплённого" if c == "angar_warm" else "холодного"
+        return {"ok": True, "text": f"Ориентир {kind} ангара: порядка {_rub(total)} рублей С МОНТАЖОМ (за само сооружение с монтажом). {_PT_SEP_ANGAR}"}
+
+    if c == "shater_restaurant":
+        a, pm = _area(), _perim()
+        if not a:
+            return {"ok": False, "need": "ширина и длина (или площадь) шатра/павильона"}
+        lo, hi = a * 11000 + 90000, a * 13000 + 90000
+        if with_walls:
+            if not (pm and wall_height):
+                return {"ok": False, "need": "высота стен (для варианта со стенами)"}
+            w = pm * float(wall_height) * 1500
+            lo += w
+            hi += w
+        return {"ok": True, "text": f"Ориентир шатра/павильона: порядка {_rub_range(lo, hi)} рублей за само сооружение. {_PT_SEP_SHATER}"}
+
+    if c == "vozduhoopornoe":
+        a = _area()
+        if not a:
+            return {"ok": False, "need": "площадь (или ширина и длина)"}
+        return {"ok": True, "text": f"Ориентир воздухоопорного сооружения: порядка {_rub(a * 8000)} рублей. {_PT_SEP_VOZDUH}"}
+
+    if c == "gipar":
+        s = float(shade_area) if shade_area else _area()
+        if not s:
+            return {"ok": False, "need": "площадь зоны тени"}
+        return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub_range(s * 7500, s * 10000)} рублей за само сооружение. Стен у гипаров не бывает. {_PT_SEP_GIPAR}"}
+
+    if c == "circus":
+        parts = []
+        if dome_diameter:
+            d = float(dome_diameter)
+            parts.append(f"купол с опорными конструкциями — порядка {_rub((d * d * 3.14 / 4) * 16500)} рублей")
+        if seats:
+            parts.append(f"трибуны на {int(float(seats))} мест — порядка {_rub(float(seats) * 6500)} рублей")
+        if not parts:
+            return {"ok": False, "need": "диаметр купола и число мест (или вместимость зала)"}
+        note = " Число мест уточните у клиента (или желаемую вместимость)." if (dome_diameter and not seats) else ""
+        return {"ok": True, "text": "Ориентир по цирку (называй суммы РАЗДЕЛЬНО, ставки и расчёт НЕ раскрывай): " + "; ".join(parts) + "." + note + " Барьер манежа, писта и прочая комплектация — отдельно. Итоговая вилка зависит от материала купола, типа опор и обработки металла."}
+
+    return {"ok": False, "need": "тип конструкции"}
+
+
+_PT_PRICE_TOOL = {
+    "name": "calculate_price",
+    "description": "Точный серверный расчёт ориентировочной цены сооружения ПРАЙМ-ТЕНТ. ВСЕГДА вызывай для любой оценки стоимости — сам цену НЕ считай. Клиенту передавай только итог из результата, округлённо, без раскрытия ставок и методики.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "construction": {"type": "string", "enum": ["shater_restaurant", "angar_cold", "angar_warm", "vozduhoopornoe", "gipar", "circus"], "description": "shater_restaurant — шатёр/тент/павильон для ресторана/кафе/площадки; angar_cold — холодный ангар; angar_warm — утеплённый ангар; vozduhoopornoe — воздухоопорное; gipar — мембранный теневой парус; circus — цирк-шапито."},
+            "width": {"type": "number", "description": "Ширина, м"},
+            "length": {"type": "number", "description": "Длина, м"},
+            "wall_height": {"type": "number", "description": "Высота стен, м (ангар; шатёр со стенами)"},
+            "area": {"type": "number", "description": "Площадь, м² (если известна вместо ширины×длины)"},
+            "with_walls": {"type": "boolean", "description": "Шатёр со стенами (true) или открытый (false)"},
+            "shade_area": {"type": "number", "description": "Площадь зоны тени гипара, м²"},
+            "dome_diameter": {"type": "number", "description": "Диаметр купола цирка, м"},
+            "seats": {"type": "number", "description": "Число мест (трибуны цирка)"},
+        },
+        "required": ["construction"],
+    },
+}
+
+
 async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> None:
     """Background: read transcript, ask LLM for structured fields, update sessions row.
     Fires a lead notification on first lead detection, routed per client."""
@@ -1878,16 +1990,14 @@ async def chat(request: Request):
     # Обезличиваем перед отправкой за рубеж (Anthropic, США): ПД → плейсхолдеры
     masked_messages, pii_map = _mask_messages(server_messages)
 
+    # Prime-Tent: даём модели инструмент серверного расчёта цены (арифметику не доверяем LLM)
+    tools = [_PT_PRICE_TOOL] if client_name == "prime-tent" else None
+    conv = list(masked_messages)
+    data = {}
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
+            for _ in range(4):  # ограничение циклов tool-use
+                body = {
                     "model": "claude-haiku-4-5-20251001",
                     "max_tokens": 2000,
                     "system": [
@@ -1897,10 +2007,36 @@ async def chat(request: Request):
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    "messages": masked_messages,
-                },
-            )
-            data = response.json()
+                    "messages": conv,
+                }
+                if tools:
+                    body["tools"] = tools
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json=body,
+                )
+                data = response.json()
+                if "error" in data or data.get("stop_reason") != "tool_use":
+                    break
+                conv.append({"role": "assistant", "content": data["content"]})
+                results = []
+                for block in data["content"]:
+                    if block.get("type") == "tool_use" and block.get("name") == "calculate_price":
+                        try:
+                            r = pt_calculate_price(**(block.get("input") or {}))
+                            out = r["text"] if r.get("ok") else ("Не хватает данных для расчёта: " + r.get("need", "") + ". Спроси у клиента недостающее.")
+                        except Exception as e:
+                            print(f"[chat] price calc failed: {_safe_err(e)}")
+                            out = "Не удалось посчитать по этим данным. Уточни параметры у клиента или предложи расчёт менеджера."
+                        results.append({"type": "tool_result", "tool_use_id": block["id"], "content": out})
+                if not results:
+                    break
+                conv.append({"role": "user", "content": results})
     except httpx.HTTPError as e:
         print(f"[chat] upstream failed: {e}")
         return JSONResponse({"error": "upstream request failed"}, status_code=502)
