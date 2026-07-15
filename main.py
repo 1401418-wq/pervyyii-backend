@@ -1722,6 +1722,36 @@ _PT_SEP_SHATER = "Отдельно считаются: монтаж, доста�
 _PT_SEP_GIPAR = "Отдельно считаются: монтаж, доставка, фундаменты (сваи под стойки и закладные оттяжек)."
 _PT_SEP_VOZDUH = "Отдельно считаются: доставка, командировочные, фундамент."
 
+# Соответствие диаметра купола цирка → диапазон числа мест (данные ПРАЙМ-ТЕНТ). Места зависят
+# от диаметра купола и компоновки проходов; НЕ зависят от высоты купола и наклона трибун.
+_CIRCUS_SEATS = [
+    (24, 550, 600), (25, 600, 650), (28, 700, 800), (30, 800, 950),
+    (32, 1000, 1100), (34, 1100, 1150), (36, 1150, 1250), (38, 1300, 1500),
+    (42, 1800, 1900), (44, 2000, 2100), (46, 2100, 2200), (48, 2500, 2500),
+]
+
+
+def _circus_seats_for_diameter(d):
+    tbl = _CIRCUS_SEATS
+    if d <= tbl[0][0]:
+        return tbl[0][1], tbl[0][2]
+    if d >= tbl[-1][0]:
+        return tbl[-1][1], tbl[-1][2]
+    for i in range(len(tbl) - 1):
+        d0, l0, h0 = tbl[i]
+        d1, l1, h1 = tbl[i + 1]
+        if d0 <= d <= d1:
+            t = (d - d0) / (d1 - d0) if d1 != d0 else 0
+            return int(round(l0 + t * (l1 - l0))), int(round(h0 + t * (h1 - h0)))
+    return tbl[-1][1], tbl[-1][2]
+
+
+def _circus_diameter_for_seats(n):
+    for d, l, h in _CIRCUS_SEATS:
+        if h >= n:
+            return d
+    return _CIRCUS_SEATS[-1][0]
+
 
 def pt_calculate_price(construction=None, width=None, length=None, wall_height=None,
                        area=None, with_walls=False, shade_area=None,
@@ -1793,15 +1823,20 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub_range(s * 7500, s * 10000)} рублей за само сооружение. Стен у гипаров не бывает. {_PT_SEP_GIPAR}"}
 
     if c == "circus":
+        d = dome_diameter
+        if seats and not d:
+            d = _circus_diameter_for_seats(seats)
         parts = []
-        if dome_diameter:
-            parts.append(f"купол с опорными конструкциями — порядка {_rub((dome_diameter * dome_diameter * 3.14 / 4) * 16500)} рублей")
+        if d:
+            parts.append(f"купол Ø{int(round(d))} м с опорными конструкциями — порядка {_rub((d * d * 3.14 / 4) * 16500)} рублей")
         if seats:
             parts.append(f"трибуны на {seats} мест — порядка {_rub(seats * 6500)} рублей")
+        elif d:
+            sl, sh = _circus_seats_for_diameter(d)
+            parts.append(f"трибуны примерно на {sl}–{sh} мест — порядка {_rub_range(sl * 6500, sh * 6500)} рублей")
         if not parts:
-            return {"ok": False, "need": "диаметр купола и число мест (или вместимость зала)"}
-        note = " Число мест уточните у клиента (или желаемую вместимость)." if (dome_diameter and not seats) else ""
-        return {"ok": True, "text": "Ориентир по цирку (называй суммы РАЗДЕЛЬНО, ставки и расчёт НЕ раскрывай): " + "; ".join(parts) + "." + note + " Барьер манежа, писта и прочая комплектация — отдельно. Итоговая вилка зависит от материала купола, типа опор и обработки металла."}
+            return {"ok": False, "need": "диаметр купола или желаемая вместимость зала"}
+        return {"ok": True, "text": "Ориентир по цирку (называй суммы РАЗДЕЛЬНО, ставки и расчёт НЕ раскрывай): " + "; ".join(parts) + ". Барьер манежа, писта, полы, доп. шатры и прочая комплектация — отдельно. Итоговая вилка в пределах примерно 3 млн зависит от материала купола, типа опор и обработки металла."}
 
     return {"ok": False, "need": "тип конструкции"}
 
