@@ -1079,8 +1079,9 @@ async def _prime_email_retry_loop() -> None:
                            ORDER BY created_at LIMIT 20"""
                     )
                 for row in rows:
+                    recipients = CLIENTS.get("prime-tent", {}).get("lead_email") or []
                     ok = await send_lead_email(
-                        ["tent@prime-tent.ru"],
+                        recipients,
                         "Новая заявка с сайта — ПРАЙМ-ТЕНТ",
                         _prime_email_body(row),
                     )
@@ -2019,13 +2020,16 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
             await conn.execute(
                 """UPDATE sessions SET
                     business_niche=$2, tariff_interest=$3, intent_summary=$4,
-                    has_lead=$5, lead_name=$6, lead_contact=$7, last_extracted_at=NOW()
+                    has_lead=$5, lead_name=$6, lead_contact=$7,
+                    email_notified=CASE WHEN $8 THEN FALSE ELSE email_notified END,
+                    last_extracted_at=NOW()
                    WHERE session_id=$1""",
                 session_id,
                 field_a, field_b, intent_summary,
                 has_lead_new,
                 local["name"],
                 local["contact"],
+                bool(cfg["kind"] == "prime-tent" and has_lead_new and not (sess and sess["lead_notified"])),
             )
         # Fire lead notification on transition false → true, routed per client
         if has_lead_new and not (sess and sess["lead_notified"]):
