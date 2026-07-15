@@ -6,10 +6,10 @@
   if (!_s || !_s.src) {
     var _all = document.querySelectorAll("script[src]");
     for (var _i = 0; _i < _all.length; _i++) {
-      if (/\/embed-primetent\.js(\?|$)/.test(_all[_i].src)) { _s = _all[_i]; break; }
+      if (/\/embed-primetent(?:\.v[0-9]+)?\.js(\?|$)/.test(_all[_i].src)) { _s = _all[_i]; break; }
     }
   }
-  var ORIGIN = (_s && _s.src) ? _s.src.replace(/\/embed-primetent\.js(\?.*)?$/, "") : "";
+  var ORIGIN = (_s && _s.src) ? _s.src.replace(/\/embed-primetent(?:\.v[0-9]+)?\.js(\?.*)?$/, "") : "";
 
   var style = document.createElement("style");
   style.textContent = [
