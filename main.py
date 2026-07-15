@@ -803,7 +803,7 @@ async def _poll_bot(token: str, path: str, secret: str) -> None:
         async with httpx.AsyncClient(timeout=30) as c:
             await c.post(f"https://api.telegram.org/bot{token}/deleteWebhook")
     except Exception as e:
-        print(f"[poll {path}] deleteWebhook failed: {_safe_err(e)}")
+        print(f"[poll {path}] deleteWebhook failed: {type(e).__name__}: {_safe_err(e)}")
     offset = 0
     while True:
         try:
@@ -825,9 +825,9 @@ async def _poll_bot(token: str, path: str, secret: str) -> None:
                     async with httpx.AsyncClient(timeout=120, trust_env=False) as lc:
                         await lc.post(f"http://127.0.0.1:8000/{path}/webhook/{secret}", json=upd)
                 except Exception as e:
-                    print(f"[poll {path}] handoff failed: {_safe_err(e)}")
+                    print(f"[poll {path}] handoff failed: {type(e).__name__}: {_safe_err(e)}")
         except Exception as e:
-            print(f"[poll {path}] loop error: {_safe_err(e)}")
+            print(f"[poll {path}] loop error: {type(e).__name__}: {_safe_err(e)}")
             await asyncio.sleep(3)
 
 
