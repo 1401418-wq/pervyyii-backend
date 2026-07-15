@@ -11,6 +11,7 @@ import base64
 import secrets
 import asyncio
 import asyncpg
+import math
 import socket
 import ipaddress
 from bs4 import BeautifulSoup
@@ -1725,24 +1726,41 @@ _PT_SEP_VOZDUH = "Отдельно считаются: доставка, ком�
 def pt_calculate_price(construction=None, width=None, length=None, wall_height=None,
                        area=None, with_walls=False, shade_area=None,
                        dome_diameter=None, seats=None, **_):
+    def _num(x, lo, hi):
+        """Конечное положительное число в [lo, hi]; иначе None (режет отрицательные, NaN, Inf, гигантские)."""
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if (math.isfinite(v) and lo <= v <= hi) else None
+
+    width = _num(width, 1, 500)
+    length = _num(length, 1, 500)
+    wall_height = _num(wall_height, 1, 50)
+    area = _num(area, 1, 250000)
+    shade_area = _num(shade_area, 1, 100000)
+    dome_diameter = _num(dome_diameter, 1, 100)
+    _seats = _num(seats, 1, 100000)
+    seats = int(_seats) if _seats is not None else None
+
     def _area():
         if area:
-            return float(area)
+            return area
         if width and length:
-            return float(width) * float(length)
+            return width * length
         return None
 
     def _perim():
         if width and length:
-            return 2.0 * (float(width) + float(length))
+            return 2.0 * (width + length)
         return None
 
     c = construction
     if c in ("angar_cold", "angar_warm"):
         a, pm = _area(), _perim()
         if not (a and pm and wall_height):
-            return {"ok": False, "need": "ширина, длина и высота стен ангара"}
-        base = a * 8000 + 90000 + pm * float(wall_height) * 1500
+            return {"ok": False, "need": "положительные ширина, длина и высота стен ангара"}
+        base = a * 8000 + 90000 + pm * wall_height * 1500
         if c == "angar_warm":
             base *= 1.35
         total = base * 1.40
@@ -1752,12 +1770,12 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
     if c == "shater_restaurant":
         a, pm = _area(), _perim()
         if not a:
-            return {"ok": False, "need": "ширина и длина (или площадь) шатра/павильона"}
+            return {"ok": False, "need": "положительные ширина и длина (или площадь) шатра/павильона"}
         lo, hi = a * 11000 + 90000, a * 13000 + 90000
         if with_walls:
             if not (pm and wall_height):
-                return {"ok": False, "need": "высота стен (для варианта со стенами)"}
-            w = pm * float(wall_height) * 1500
+                return {"ok": False, "need": "положительная высота стен (для варианта со стенами)"}
+            w = pm * wall_height * 1500
             lo += w
             hi += w
         return {"ok": True, "text": f"Ориентир шатра/павильона: порядка {_rub_range(lo, hi)} рублей за само сооружение. {_PT_SEP_SHATER}"}
@@ -1765,22 +1783,21 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
     if c == "vozduhoopornoe":
         a = _area()
         if not a:
-            return {"ok": False, "need": "площадь (или ширина и длина)"}
+            return {"ok": False, "need": "положительная площадь (или ширина и длина)"}
         return {"ok": True, "text": f"Ориентир воздухоопорного сооружения: порядка {_rub(a * 8000)} рублей. {_PT_SEP_VOZDUH}"}
 
     if c == "gipar":
-        s = float(shade_area) if shade_area else _area()
+        s = shade_area or _area()
         if not s:
-            return {"ok": False, "need": "площадь зоны тени"}
+            return {"ok": False, "need": "положительная площадь зоны тени"}
         return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub_range(s * 7500, s * 10000)} рублей за само сооружение. Стен у гипаров не бывает. {_PT_SEP_GIPAR}"}
 
     if c == "circus":
         parts = []
         if dome_diameter:
-            d = float(dome_diameter)
-            parts.append(f"купол с опорными конструкциями — порядка {_rub((d * d * 3.14 / 4) * 16500)} рублей")
+            parts.append(f"купол с опорными конструкциями — порядка {_rub((dome_diameter * dome_diameter * 3.14 / 4) * 16500)} рублей")
         if seats:
-            parts.append(f"трибуны на {int(float(seats))} мест — порядка {_rub(float(seats) * 6500)} рублей")
+            parts.append(f"трибуны на {seats} мест — порядка {_rub(seats * 6500)} рублей")
         if not parts:
             return {"ok": False, "need": "диаметр купола и число мест (или вместимость зала)"}
         note = " Число мест уточните у клиента (или желаемую вместимость)." if (dome_diameter and not seats) else ""
@@ -1796,14 +1813,14 @@ _PT_PRICE_TOOL = {
         "type": "object",
         "properties": {
             "construction": {"type": "string", "enum": ["shater_restaurant", "angar_cold", "angar_warm", "vozduhoopornoe", "gipar", "circus"], "description": "shater_restaurant — шатёр/тент/павильон для ресторана/кафе/площадки; angar_cold — холодный ангар; angar_warm — утеплённый ангар; vozduhoopornoe — воздухоопорное; gipar — мембранный теневой парус; circus — цирк-шапито."},
-            "width": {"type": "number", "description": "Ширина, м"},
-            "length": {"type": "number", "description": "Длина, м"},
-            "wall_height": {"type": "number", "description": "Высота стен, м (ангар; шатёр со стенами)"},
-            "area": {"type": "number", "description": "Площадь, м² (если известна вместо ширины×длины)"},
+            "width": {"type": "number", "minimum": 1, "maximum": 500, "description": "Ширина, м"},
+            "length": {"type": "number", "minimum": 1, "maximum": 500, "description": "Длина, м"},
+            "wall_height": {"type": "number", "minimum": 1, "maximum": 50, "description": "Высота стен, м (ангар; шатёр со стенами)"},
+            "area": {"type": "number", "minimum": 1, "maximum": 250000, "description": "Площадь, м² (если известна вместо ширины×длины)"},
             "with_walls": {"type": "boolean", "description": "Шатёр со стенами (true) или открытый (false)"},
-            "shade_area": {"type": "number", "description": "Площадь зоны тени гипара, м²"},
-            "dome_diameter": {"type": "number", "description": "Диаметр купола цирка, м"},
-            "seats": {"type": "number", "description": "Число мест (трибуны цирка)"},
+            "shade_area": {"type": "number", "minimum": 1, "maximum": 100000, "description": "Площадь зоны тени гипара, м²"},
+            "dome_diameter": {"type": "number", "minimum": 1, "maximum": 100, "description": "Диаметр купола цирка, м"},
+            "seats": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Число мест (трибуны цирка), целое"},
         },
         "required": ["construction"],
     },
@@ -1994,6 +2011,7 @@ async def chat(request: Request):
     tools = [_PT_PRICE_TOOL] if client_name == "prime-tent" else None
     conv = list(masked_messages)
     data = {}
+    response = None
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             for _ in range(4):  # ограничение циклов tool-use
@@ -2020,33 +2038,55 @@ async def chat(request: Request):
                     },
                     json=body,
                 )
-                data = response.json()
-                if "error" in data or data.get("stop_reason") != "tool_use":
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {"error": "non-json upstream response"}
                     break
-                conv.append({"role": "assistant", "content": data["content"]})
+                if not isinstance(data, dict) or "error" in data or data.get("stop_reason") != "tool_use":
+                    break
+                content = data.get("content")
+                if not isinstance(content, list):
+                    break
+                conv.append({"role": "assistant", "content": content})
                 results = []
-                for block in data["content"]:
-                    if block.get("type") == "tool_use" and block.get("name") == "calculate_price":
-                        try:
-                            r = pt_calculate_price(**(block.get("input") or {}))
-                            out = r["text"] if r.get("ok") else ("Не хватает данных для расчёта: " + r.get("need", "") + ". Спроси у клиента недостающее.")
-                        except Exception as e:
-                            print(f"[chat] price calc failed: {_safe_err(e)}")
-                            out = "Не удалось посчитать по этим данным. Уточни параметры у клиента или предложи расчёт менеджера."
-                        results.append({"type": "tool_result", "tool_use_id": block["id"], "content": out})
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use" or block.get("name") != "calculate_price":
+                        continue
+                    tid = block.get("id")
+                    if not isinstance(tid, str) or not tid:
+                        continue
+                    inp = block.get("input")
+                    if not isinstance(inp, dict):
+                        inp = {}
+                    try:
+                        r = pt_calculate_price(**inp)
+                        out = r["text"] if r.get("ok") else ("Не хватает корректных данных для расчёта: " + r.get("need", "") + ". Спроси у клиента недостающее.")
+                    except Exception as e:
+                        print(f"[chat] price calc failed: {_safe_err(e)}")
+                        out = "Не удалось посчитать по этим данным. Уточни параметры у клиента или предложи расчёт менеджера."
+                    results.append({"type": "tool_result", "tool_use_id": tid, "content": out})
                 if not results:
                     break
                 conv.append({"role": "user", "content": results})
     except httpx.HTTPError as e:
         print(f"[chat] upstream failed: {e}")
         return JSONResponse({"error": "upstream request failed"}, status_code=502)
+    except Exception as e:
+        print(f"[chat] chat loop failed: {_safe_err(e)}")
+        return JSONResponse({"error": "upstream request failed"}, status_code=502)
 
-    if "error" in data:
-        print(f"[chat] upstream error: {data['error']}")
-        return JSONResponse({"error": "upstream error"}, status_code=response.status_code or 500)
+    if not isinstance(data, dict) or "error" in data:
+        err = data.get("error") if isinstance(data, dict) else data
+        print(f"[chat] upstream error: {err}")
+        return JSONResponse({"error": "upstream error"}, status_code=(response.status_code if response is not None else 500))
 
-    content = data.get("content") or []
-    text_parts = [block.get("text", "") for block in content if block.get("type") == "text"]
+    content = data.get("content")
+    if not isinstance(content, list):
+        content = []
+    text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
     reply = "".join(text_parts).strip()
     if not reply:
         print(f"[chat] empty reply, raw={data}")
