@@ -1076,6 +1076,7 @@ async def _prime_email_retry_loop() -> None:
                            FROM sessions
                            WHERE has_lead=TRUE AND email_notified=FALSE
                              AND referrer LIKE 'prime-tent.ru/%'
+                             AND last_extracted_at < NOW() - INTERVAL '2 minutes'
                            ORDER BY created_at LIMIT 20"""
                     )
                 for row in rows:
