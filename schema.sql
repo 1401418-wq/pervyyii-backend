@@ -47,6 +47,19 @@ CREATE TABLE IF NOT EXISTS alerts_subscribers (
     PRIMARY KEY (chat_id, source)
 );
 
+-- Обезличенная воронка виджета: одна запись каждого типа на сессию.
+CREATE TABLE IF NOT EXISTS widget_events (
+    client TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    event_name TEXT NOT NULL CHECK (event_name IN
+      ('widget_loaded','widget_opened','consent_given','message_sent','lead_created')),
+    page TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (client, session_id, event_name)
+);
+CREATE INDEX IF NOT EXISTS idx_widget_events_client_time
+  ON widget_events(client, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS business_connections (
     user_chat_id BIGINT PRIMARY KEY,
     business_connection_id TEXT NOT NULL,

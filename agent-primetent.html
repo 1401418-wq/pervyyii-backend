@@ -135,6 +135,13 @@
       : String(Date.now()) + Math.random().toString(16).slice(2));
     sessionStorage.setItem("pt_sid", sessionId);
   }
+  function trackEvent(name) {
+    try {
+      fetch("widget-events", {method:"POST", headers:{"Content-Type":"application/json"},
+        keepalive:true, body:JSON.stringify({client:"prime-tent", event:name,
+          session_id:sessionId, page:referrer})}).catch(function(){});
+    } catch (_) {}
+  }
 
   function setEnabled(on) {
     inputEl.disabled = !on;
@@ -142,7 +149,7 @@
   }
   consentEl.addEventListener("change", function () {
     setEnabled(consentEl.checked);
-    if (consentEl.checked) inputEl.focus();
+    if (consentEl.checked) { trackEvent("consent_given"); inputEl.focus(); }
   });
 
   function addMessage(text, who) {
@@ -174,6 +181,7 @@
     if (!text) return;
 
     addMessage(text, "user");
+    trackEvent("message_sent");
     history.push({ role: "user", content: text });
     inputEl.value = "";
     setEnabled(false);

@@ -24,6 +24,8 @@ ALLOWED_ORIGINS = [
     "https://www.pervyyii.ru",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
+    "https://prime-tent.ru",
+    "https://www.prime-tent.ru",
 ]
 
 app.add_middleware(
@@ -116,6 +118,8 @@ _CLIENT_REF_HOSTS = {
     "prime-tent": {"prime-tent.ru", "www.prime-tent.ru"},
     "pervyyii": {"pervyyii.ru", "www.pervyyii.ru"},
 }
+
+_WIDGET_EVENTS = {"widget_loaded", "widget_opened", "consent_given", "message_sent", "lead_created"}
 
 
 def _client_ref_allowed(client: str, referrer: str) -> bool:
@@ -2034,6 +2038,14 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
             )
         # Fire lead notification on transition false → true, routed per client
         if has_lead_new and not (sess and sess["lead_notified"]):
+            if cfg["kind"] == "prime-tent":
+                # Воронка хранит только факт заявки и уже обезличенную страницу.
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO widget_events(client, session_id, event_name, page)
+                           VALUES('prime-tent',$1,'lead_created',$2) ON CONFLICT DO NOTHING""",
+                        session_id, _sanitize_referrer(str((sess and sess["referrer"]) or ""))[:200],
+                    )
             name = html.escape(str(local["name"] or "—"))
             contact = html.escape(str(local["contact"] or "—"))
             summary = html.escape(str(intent_summary))
@@ -2080,6 +2092,71 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                 )
     except Exception as e:
         print(f"[extract] failed for {session_id}: {e}")
+
+
+# ─────────────────── Обезличенная аналитика виджета ───────────────────
+
+@app.post("/widget-events")
+async def widget_event(request: Request):
+    """Записать одно обезличенное событие воронки.
+
+    Содержимое сообщений, контакты, IP и user-agent намеренно не принимаются.
+    Повтор того же события в сессии идемпотентен.
+    """
+    origin = request.headers.get("origin", "")
+    if origin and origin not in {"https://prime-tent.ru", "https://www.prime-tent.ru", *(_ALLOWED_CHAT_ORIGINS)}:
+        raise HTTPException(403, "forbidden origin")
+    if _rate_limited("widget-events:" + (_client_ip(request) or "unknown"), limit=120, window=3600):
+        raise HTTPException(429, "too many events")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON")
+    client = str(body.get("client") or "").strip().lower()
+    event = str(body.get("event") or "").strip().lower()
+    session_id = str(body.get("session_id") or "")[:80]
+    page = _sanitize_referrer(str(body.get("page") or ""))
+    if client != "prime-tent" or event not in _WIDGET_EVENTS or not session_id or not page:
+        raise HTTPException(400, "invalid event")
+    if not _client_ref_allowed(client, page):
+        raise HTTPException(403, "client/page mismatch")
+    if not pool:
+        return {"ok": True}
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO widget_events(client, session_id, event_name, page)
+                   VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING""",
+                client, session_id, event, page[:200],
+            )
+    except Exception as e:
+        print(f"[widget-events] failed: {type(e).__name__}")
+        return JSONResponse({"ok": False}, status_code=503)
+    return {"ok": True}
+
+
+@app.get("/admin/widget-funnel")
+async def admin_widget_funnel(request: Request, days: int = 7):
+    require_admin(request)
+    if not pool:
+        raise HTTPException(503, "database not configured")
+    days = max(1, min(int(days), 90))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT event_name, COUNT(*) AS count
+               FROM widget_events
+               WHERE client='prime-tent' AND created_at >= NOW() - ($1::int * INTERVAL '1 day')
+               GROUP BY event_name""", days
+        )
+        pages = await conn.fetch(
+            """SELECT page, event_name, COUNT(*) AS count
+               FROM widget_events
+               WHERE client='prime-tent' AND created_at >= NOW() - ($1::int * INTERVAL '1 day')
+               GROUP BY page, event_name ORDER BY page, event_name""", days
+        )
+    return {"client": "prime-tent", "days": days,
+            "events": {r["event_name"]: r["count"] for r in rows},
+            "pages": [dict(r) for r in pages]}
 
 
 # ─────────────────── Chat ───────────────────
@@ -2841,7 +2918,7 @@ async def embed_primetent_js():
 # браузер отвергнет. CORS обязателен для SRI на кросс-доменном скрипте.
 # Обновление = новый файл embed-primetent.vN.js + запись в _EMBED_VERSIONS + новый
 # integrity на страницах клиента (старые версии остаются валидными).
-_EMBED_VERSIONS = {"v1"}
+_EMBED_VERSIONS = {"v1", "v2"}
 
 
 @app.get("/embed-primetent.{version}.js")
