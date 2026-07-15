@@ -2162,6 +2162,36 @@ async def admin_widget_funnel(request: Request, days: int = 7, client: str = "pr
             "pages": [dict(r) for r in pages]}
 
 
+@app.get("/funnel", response_class=HTMLResponse)
+async def public_funnel():
+    """Простая обезличенная сводка собственного демо без админских данных."""
+    if not pool:
+        return HTMLResponse("<h1>Статистика пока недоступна</h1>", status_code=503)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT event_name, COUNT(*) AS count FROM widget_events
+               WHERE client='pervyyii' AND created_at >= NOW() - INTERVAL '30 days'
+               GROUP BY event_name"""
+        )
+    counts = {r["event_name"]: int(r["count"]) for r in rows}
+    loaded = counts.get("widget_loaded", 0)
+    messages = counts.get("message_sent", 0)
+    leads = counts.get("lead_created", 0)
+    pct = round(messages * 100 / loaded) if loaded else 0
+    return HTMLResponse(f"""<!doctype html><meta charset='utf-8'>
+<title>Статистика помощника</title>
+<style>body{{font:18px -apple-system,BlinkMacSystemFont,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;color:#222}}
+h1{{font-size:30px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:16px}}
+.card{{padding:24px;border-radius:14px;background:#f4f5f7}}.n{{font-size:42px;font-weight:700;margin-top:8px}}
+.muted{{color:#6b7280;font-size:14px;margin-top:28px}}</style>
+<h1>Помощник Первого ИИ</h1><p>Статистика за последние 30 дней</p>
+<div class='grid'><div class='card'>Открыли помощника<div class='n'>{loaded}</div></div>
+<div class='card'>Задали вопрос<div class='n'>{messages}</div></div>
+<div class='card'>Оставили заявку<div class='n'>{leads}</div></div>
+<div class='card'>Открытие → вопрос<div class='n'>{pct}%</div></div></div>
+<p class='muted'>Статистика обезличена: тексты, имена и контакты здесь не отображаются.</p>""")
+
+
 # ─────────────────── Chat ───────────────────
 
 @app.post("/chat")
