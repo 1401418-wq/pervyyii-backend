@@ -44,6 +44,10 @@ DEMO_BOT_TOKEN = os.environ.get("DEMO_BOT_TOKEN", "")
 DEMO_WEBHOOK_SECRET = os.environ.get("DEMO_WEBHOOK_SECRET", "")
 ALERTS_BOT_TOKEN = os.environ.get("ALERTS_BOT_TOKEN", "")
 ALERTS_WEBHOOK_SECRET = os.environ.get("ALERTS_WEBHOOK_SECRET", "")
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
 BUSINESS_BOT_TOKEN = os.environ.get("BUSINESS_BOT_TOKEN", "")
 BUSINESS_WEBHOOK_SECRET = os.environ.get("BUSINESS_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # для авторегистрации webhook
@@ -1013,6 +1017,29 @@ async def alerts_send(source: str, text: str) -> None:
         print(f"[alerts] alerts_send failed: {e}")
 
 
+def _send_email_sync(to_addrs, subject, body):
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["From"] = f"Заявки с сайта ПРАЙМ-ТЕНТ <{SMTP_USER}>"
+    msg["To"] = ", ".join(to_addrs)
+    msg["Subject"] = subject
+    msg.set_content(body)
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+        s.login(SMTP_USER, SMTP_PASS)
+        s.send_message(msg)
+
+
+async def send_lead_email(to_addrs, subject, body) -> None:
+    """Отправка заявки на почту клиента. Fire-and-forget, не роняет."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and to_addrs):
+        return
+    try:
+        await asyncio.to_thread(_send_email_sync, to_addrs, subject, body)
+    except Exception as e:
+        print(f"[email] send failed: {_safe_err(e)}")
+
+
 @app.post("/alerts/webhook/{secret}")
 async def alerts_webhook(secret: str, request: Request):
     if not ALERTS_WEBHOOK_SECRET or not secrets.compare_digest(secret, ALERTS_WEBHOOK_SECRET):
@@ -1677,6 +1704,7 @@ CLIENTS = {
         "system": PRIMETENT_SYSTEM,
         "extraction": PRIMETENT_EXTRACTION,
         "alerts_source": "prime-tent",
+        "lead_email": ["tent@prime-tent.ru"],
         "lead_label": "ПРАЙМ-ТЕНТ",
         "kind": "prime-tent",
     },
@@ -1954,6 +1982,19 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                     f"<b>Страница:</b> {page}\n\n"
                     f"<i>{summary}</i>"
                 )
+                lead_email = cfg.get("lead_email")
+                if lead_email:
+                    email_body = (
+                        "Новая заявка с сайта prime-tent.ru\n\n"
+                        f"Имя: {local['name'] or '—'}\n"
+                        f"Контакт: {local['contact'] or '—'}\n"
+                        f"Конструкция: {field_a}\n"
+                        f"Размер/город: {field_b}\n"
+                        f"Страница: {(sess and sess['referrer']) or '—'}\n\n"
+                        f"{intent_summary}\n\n"
+                        "— Отправлено ИИ-помощником ПРАЙМ-ТЕНТ"
+                    )
+                    await send_lead_email(lead_email, "Новая заявка с сайта — ПРАЙМ-ТЕНТ", email_body)
             else:
                 await tg_send(
                     f"🎯 <b>Новый лид с {cfg['lead_label']}</b>\n\n"
