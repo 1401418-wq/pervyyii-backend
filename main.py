@@ -2116,7 +2116,7 @@ async def widget_event(request: Request):
     event = str(body.get("event") or "").strip().lower()
     session_id = str(body.get("session_id") or "")[:80]
     page = _sanitize_referrer(str(body.get("page") or ""))
-    if client != "prime-tent" or event not in _WIDGET_EVENTS or not session_id or not page:
+    if client not in _CLIENT_REF_HOSTS or event not in _WIDGET_EVENTS or not session_id or not page:
         raise HTTPException(400, "invalid event")
     if not _client_ref_allowed(client, page):
         raise HTTPException(403, "client/page mismatch")
@@ -2136,25 +2136,28 @@ async def widget_event(request: Request):
 
 
 @app.get("/admin/widget-funnel")
-async def admin_widget_funnel(request: Request, days: int = 7):
+async def admin_widget_funnel(request: Request, days: int = 7, client: str = "prime-tent"):
     require_admin(request)
     if not pool:
         raise HTTPException(503, "database not configured")
     days = max(1, min(int(days), 90))
+    client = client.strip().lower()
+    if client not in _CLIENT_REF_HOSTS:
+        raise HTTPException(400, "unknown client")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT event_name, COUNT(*) AS count
                FROM widget_events
-               WHERE client='prime-tent' AND created_at >= NOW() - ($1::int * INTERVAL '1 day')
-               GROUP BY event_name""", days
+               WHERE client=$2 AND created_at >= NOW() - ($1::int * INTERVAL '1 day')
+               GROUP BY event_name""", days, client
         )
         pages = await conn.fetch(
             """SELECT page, event_name, COUNT(*) AS count
                FROM widget_events
-               WHERE client='prime-tent' AND created_at >= NOW() - ($1::int * INTERVAL '1 day')
-               GROUP BY page, event_name ORDER BY page, event_name""", days
+               WHERE client=$2 AND created_at >= NOW() - ($1::int * INTERVAL '1 day')
+               GROUP BY page, event_name ORDER BY page, event_name""", days, client
         )
-    return {"client": "prime-tent", "days": days,
+    return {"client": client, "days": days,
             "events": {r["event_name"]: r["count"] for r in rows},
             "pages": [dict(r) for r in pages]}
 

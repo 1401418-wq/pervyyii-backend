@@ -188,6 +188,13 @@
   const inputEl = document.getElementById("input");
   const sendBtn = document.getElementById("send");
   const history = [];
+  const analyticsSession = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+  function trackEvent(name) {
+    fetch("/widget-events", {method:"POST", headers:{"Content-Type":"application/json"},
+      keepalive:true, body:JSON.stringify({client:"pervyyii", event:name,
+        session_id:analyticsSession, page:"https://pervyyii.ru/"})}).catch(function(){});
+  }
+  trackEvent("widget_loaded");
 
   function addMessage(text, who) {
     const div = document.createElement("div");
@@ -216,6 +223,7 @@
     if (!text) return;
 
     addMessage(text, "user");
+    trackEvent("message_sent");
     history.push({ role: "user", content: text });
     inputEl.value = "";
     sendBtn.disabled = true;
