@@ -1928,21 +1928,29 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
                 return {"ok": False, "need": f"наши модели купола (24–48 м) вмещают примерно до {max_seats} мест; для большего — расчёт менеджера"}
             d = _circus_diameter_for_seats(seats)
         parts = []
+        total = 0
         if d:
-            parts.append(f"купол Ø{int(round(d))} м с опорными конструкциями — порядка {_rub((d * d * 3.14 / 4) * 16500)} рублей")
+            dome_price = (d * d * 3.14 / 4) * 16500
+            total += dome_price
+            parts.append(f"купол Ø{int(round(d))} м с опорными конструкциями — порядка {_rub(dome_price)} рублей")
         if seats:
             if d:
                 _, sh = _circus_seats_for_diameter(d)
                 if seats > sh:
                     return {"ok": False, "need": f"купол Ø{int(round(d))} м вмещает примерно до {sh} мест — для {seats} мест нужен купол большего диаметра; уточни диаметр купола или число мест"}
-            parts.append(f"трибуны на {seats} мест — порядка {_rub(seats * 6500)} рублей")
+            seats_price = seats * 6500
+            total += seats_price
+            parts.append(f"пластиковые кресла с высокой спинкой на {seats} мест — порядка {_rub(seats_price)} рублей")
         elif d:
             sl, sh = _circus_seats_for_diameter(d)
             seats_str = f"{sl}" if sl == sh else f"{sl}–{sh}"
-            parts.append(f"трибуны примерно на {seats_str} мест — порядка {_rub_range(sl * 6500, sh * 6500)} рублей")
+            seats_price_lo, seats_price_hi = sl * 6500, sh * 6500
+            total = (total + seats_price_lo, total + seats_price_hi)
+            parts.append(f"пластиковые кресла с высокой спинкой примерно на {seats_str} мест — порядка {_rub_range(seats_price_lo, seats_price_hi)} рублей")
         if not parts:
             return {"ok": False, "need": "диаметр купола или желаемая вместимость зала"}
-        return {"ok": True, "text": "Ориентир по цирку (называй суммы РАЗДЕЛЬНО, ставки и расчёт НЕ раскрывай): " + "; ".join(parts) + ". Барьер манежа, писта, полы, доп. шатры и прочая комплектация — отдельно. Итоговая стоимость зависит от комплектации, материалов, опорных конструкций и монтажа; точный расчёт делает менеджер."}
+        total_text = _rub(total) if isinstance(total, (int, float)) else _rub_range(total[0], total[1])
+        return {"ok": True, "text": "Ориентир по цирку (называй суммы РАЗДЕЛЬНО, ставки и расчёт НЕ раскрывай): " + "; ".join(parts) + f"; предварительно вместе — порядка {total_text} рублей. Барьер манежа, писта, полы, доп. шатры и прочая комплектация — отдельно. Итоговая стоимость зависит от комплектации, материалов, опорных конструкций и монтажа; точный расчёт делает менеджер."}
 
     return {"ok": False, "need": "тип конструкции"}
 
