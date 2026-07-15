@@ -2499,3 +2499,21 @@ async def agent_primetent_page():
 @app.get("/embed-primetent.js")
 async def embed_primetent_js():
     return FileResponse("embed-primetent.js", media_type="application/javascript")
+
+
+# Иммутабельный версионированный loader под SRI: клиент подключает конкретную
+# замороженную версию с integrity+crossorigin, поэтому подмену файла на сервере
+# браузер отвергнет. CORS обязателен для SRI на кросс-доменном скрипте.
+# Обновление = новый файл embed-primetent.vN.js + запись в _EMBED_VERSIONS + новый
+# integrity на страницах клиента (старые версии остаются валидными).
+_EMBED_VERSIONS = {"v1"}
+
+
+@app.get("/embed-primetent.{version}.js")
+async def embed_primetent_versioned(version: str):
+    if version not in _EMBED_VERSIONS:
+        return JSONResponse({"error": "unknown version"}, status_code=404)
+    resp = FileResponse(f"embed-primetent.{version}.js", media_type="application/javascript")
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
