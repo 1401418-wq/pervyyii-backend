@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     msg_count INTEGER DEFAULT 0,
     last_extracted_at TIMESTAMPTZ
 );
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS interest TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS email_notified BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS email_last_error TEXT;
 
