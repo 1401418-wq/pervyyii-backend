@@ -1948,13 +1948,13 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
                     return {"ok": False, "need": f"купол Ø{int(round(d))} м вмещает примерно до {sh} мест — для {seats} мест нужен купол большего диаметра; уточни диаметр купола или число мест"}
             seats_price = seats * 6500
             total += seats_price
-            parts.append(f"пластиковые кресла с высокой спинкой на {seats} мест — порядка {_rub(seats_price)} рублей")
+            parts.append(f"зрительный зал с пластиковыми креслами на {seats} мест — порядка {_rub(seats_price)} рублей")
         elif d:
             sl, sh = _circus_seats_for_diameter(d)
             seats_str = f"{sl}" if sl == sh else f"{sl}–{sh}"
             seats_price_lo, seats_price_hi = sl * 6500, sh * 6500
             total = (total + seats_price_lo, total + seats_price_hi)
-            parts.append(f"пластиковые кресла с высокой спинкой примерно на {seats_str} мест — порядка {_rub_range(seats_price_lo, seats_price_hi)} рублей")
+            parts.append(f"зрительный зал с пластиковыми креслами примерно на {seats_str} мест — порядка {_rub_range(seats_price_lo, seats_price_hi)} рублей")
         if not parts:
             return {"ok": False, "need": "диаметр купола или желаемая вместимость зала"}
         total_text = _rub(total) if isinstance(total, (int, float)) else _rub_range(total[0], total[1])
@@ -2297,6 +2297,10 @@ async def chat(request: Request):
 
     # Prime-Tent: даём модели инструмент серверного расчёта цены (арифметику не доверяем LLM)
     tools = [_PT_PRICE_TOOL] if client_name == "prime-tent" else None
+    # Prime-Tent — флагманский сценарий цирков; Haiku не тянет многошаговый сбор параметров.
+    # Sonnet 5 с ВЫКЛЮЧЕННЫМ thinking: без него Sonnet включает adaptive-мышление по умолчанию,
+    # съедает max_tokens=2000 и тормозит чат. disabled сохраняет скорость, даёт прирост ума.
+    model_id = "claude-sonnet-5" if client_name == "prime-tent" else "claude-haiku-4-5-20251001"
     conv = list(masked_messages)
     system_prompt = client_cfg["system"]
     if interest:
@@ -2309,7 +2313,7 @@ async def chat(request: Request):
         async with httpx.AsyncClient(timeout=60) as client:
             for _ in range(4):  # ограничение циклов tool-use
                 body = {
-                    "model": "claude-haiku-4-5-20251001",
+                    "model": model_id,
                     "max_tokens": 2000,
                     "system": [
                         {
@@ -2322,6 +2326,8 @@ async def chat(request: Request):
                 }
                 if tools:
                     body["tools"] = tools
+                if model_id == "claude-sonnet-5":
+                    body["thinking"] = {"type": "disabled"}
                 response = await client.post(
                     "https://api.anthropic.com/v1/messages",
                     headers={
