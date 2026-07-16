@@ -1006,9 +1006,9 @@ async def _register_alerts_webhook() -> None:
         print(f"[alerts] webhook registration failed: {e}")
 
 
-async def _alerts_send_to(chat_id: int, text: str, parse_mode: str | None = "HTML") -> None:
+async def _alerts_send_to(chat_id: int, text: str, parse_mode: str | None = "HTML") -> bool:
     if not ALERTS_BOT_TOKEN:
-        return
+        return False
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -1020,12 +1020,15 @@ async def _alerts_send_to(chat_id: int, text: str, parse_mode: str | None = "HTM
             )
             if r.status_code >= 400 and parse_mode:
                 payload.pop("parse_mode", None)
-                await client.post(
+                retry = await client.post(
                     f"https://api.telegram.org/bot{ALERTS_BOT_TOKEN}/sendMessage",
                     json=payload,
                 )
+                return retry.status_code < 400
+            return r.status_code < 400
     except Exception as e:
-        print(f"[alerts] send to {chat_id} failed: {e}")
+        print(f"[alerts] send to {chat_id} failed: {type(e).__name__}: {_safe_err(e)}")
+        return False
 
 
 async def alerts_send(source: str, text: str) -> bool:
@@ -1038,9 +1041,8 @@ async def alerts_send(source: str, text: str) -> bool:
                 "SELECT chat_id FROM alerts_subscribers WHERE source=$1",
                 source,
             )
-        for r in rows:
-            await _alerts_send_to(r["chat_id"], text)
-        return bool(rows)
+        results = [await _alerts_send_to(r["chat_id"], text) for r in rows]
+        return bool(rows) and all(results)
     except Exception as e:
         print(f"[alerts] alerts_send failed: {e}")
         return False
