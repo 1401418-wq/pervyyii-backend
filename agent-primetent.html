@@ -127,6 +127,7 @@
   // Страница-источник (передаётся из embed.js через ?ref=)
   const params = new URLSearchParams(location.search);
   const referrer = params.get("ref") || document.referrer || "";
+  const interest = (params.get("interest") || "").slice(0, 80);
 
   // Стабильный session_id на сессию — для серверной истории диалога
   let sessionId = sessionStorage.getItem("pt_sid");
@@ -195,7 +196,8 @@
           messages: history,
           session_id: sessionId,
           client: "prime-tent",
-          referrer: referrer
+          referrer: referrer,
+          interest: interest
         })
       });
       const data = await res.json();

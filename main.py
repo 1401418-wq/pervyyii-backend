@@ -119,6 +119,13 @@ _CLIENT_REF_HOSTS = {
     "pervyyii": {"pervyyii.ru", "www.pervyyii.ru"},
 }
 
+_PRIME_CIRCUS_INTERESTS = {
+    "rosgoscirk": "Росгосцирк, купол 32 м",
+    "vivat": "Виват, купол 30 м",
+    "bmc": "Большой Московский цирк, купол 36 м",
+    "nikulin": "Цирк Никулина, купол 38 м",
+}
+
 _WIDGET_EVENTS = {"widget_loaded", "widget_opened", "consent_given", "message_sent", "lead_created"}
 
 
@@ -1062,6 +1069,7 @@ def _prime_email_body(row) -> str:
         f"Имя: {row['lead_name'] or '—'}\n"
         f"Контакт: {row['lead_contact'] or '—'}\n"
         f"Конструкция: {row['business_niche'] or 'не определено'}\n"
+        f"Интерес к цирку: {row['interest'] or '—'}\n"
         f"Размер/город: {row['tariff_interest'] or 'не указаны'}\n"
         f"Страница: {row['referrer'] or '—'}\n\n"
         f"{row['intent_summary'] or ''}\n\n"
@@ -1076,7 +1084,7 @@ async def _prime_email_retry_loop() -> None:
                 async with pool.acquire() as conn:
                     rows = await conn.fetch(
                         """SELECT session_id, lead_name, lead_contact, business_niche,
-                                  tariff_interest, intent_summary, referrer
+                                  tariff_interest, intent_summary, referrer, interest
                            FROM sessions
                            WHERE has_lead=TRUE AND email_notified=FALSE
                              AND referrer LIKE 'prime-tent.ru/%'
@@ -1989,7 +1997,7 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                 session_id,
             )
             sess = await conn.fetchrow(
-                "SELECT has_lead, lead_notified, referrer FROM sessions WHERE session_id=$1",
+                "SELECT has_lead, lead_notified, referrer, interest FROM sessions WHERE session_id=$1",
                 session_id,
             )
         if not rows:
@@ -2066,6 +2074,7 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                     f"<b>Контакт:</b> {contact}\n"
                     f"<b>Конструкция:</b> {html.escape(str(field_a))}\n"
                     f"<b>Размер/город:</b> {html.escape(str(field_b))}\n"
+                    f"<b>Карточка:</b> {html.escape(str((sess and sess['interest']) or '—'))}\n"
                     f"<b>Страница:</b> {page}\n\n"
                     f"<i>{summary}</i>"
                 )
@@ -2077,6 +2086,7 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                         _prime_email_body({
                             "lead_name": local["name"], "lead_contact": local["contact"],
                             "business_niche": field_a, "tariff_interest": field_b,
+                            "interest": (sess and sess["interest"]),
                             "referrer": (sess and sess["referrer"]), "intent_summary": intent_summary,
                         }),
                     )
@@ -2242,6 +2252,9 @@ async def chat(request: Request):
 
     session_id = body.get("session_id") or str(uuid.uuid4())
     referrer = _sanitize_referrer(body.get("referrer") or "")
+    interest = str(body.get("interest") or "").strip().lower()[:40]
+    if client_name != "prime-tent" or interest not in _PRIME_CIRCUS_INTERESTS:
+        interest = ""
     if not _client_ref_allowed(client_name, referrer):
         return JSONResponse({"error": "client/referrer mismatch"}, status_code=403)
     user_agent = request.headers.get("user-agent", "")[:500]
@@ -2257,10 +2270,11 @@ async def chat(request: Request):
         try:
             async with pool.acquire() as conn:
                 await conn.execute(
-                    """INSERT INTO sessions (session_id, user_agent, referrer, ip)
-                       VALUES ($1, $2, $3, $4)
-                       ON CONFLICT (session_id) DO UPDATE SET last_activity_at=NOW()""",
-                    session_id, user_agent, referrer[:500], ip[:64],
+                    """INSERT INTO sessions (session_id, user_agent, referrer, ip, interest)
+                       VALUES ($1, $2, $3, $4, $5)
+                       ON CONFLICT (session_id) DO UPDATE SET last_activity_at=NOW(),
+                         interest=COALESCE(NULLIF(EXCLUDED.interest,''), sessions.interest)""",
+                    session_id, user_agent, referrer[:500], ip[:64], interest,
                 )
                 rows = await conn.fetch(
                     """SELECT role, content FROM messages
@@ -2284,6 +2298,11 @@ async def chat(request: Request):
     # Prime-Tent: даём модели инструмент серверного расчёта цены (арифметику не доверяем LLM)
     tools = [_PT_PRICE_TOOL] if client_name == "prime-tent" else None
     conv = list(masked_messages)
+    system_prompt = client_cfg["system"]
+    if interest:
+        system_prompt += (f"\n\nКОНТЕКСТ ОТКРЫТОЙ КАРТОЧКИ: клиент сейчас смотрит "
+                          f"{_PRIME_CIRCUS_INTERESTS[interest]}. Считай интерес именно к этому "
+                          "цирку и не спрашивай город установки.")
     data = {}
     response = None
     try:
@@ -2295,7 +2314,7 @@ async def chat(request: Request):
                     "system": [
                         {
                             "type": "text",
-                            "text": client_cfg["system"],
+                            "text": system_prompt,
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
@@ -2959,7 +2978,7 @@ async def embed_primetent_js():
 # браузер отвергнет. CORS обязателен для SRI на кросс-доменном скрипте.
 # Обновление = новый файл embed-primetent.vN.js + запись в _EMBED_VERSIONS + новый
 # integrity на страницах клиента (старые версии остаются валидными).
-_EMBED_VERSIONS = {"v1", "v2"}
+_EMBED_VERSIONS = {"v1", "v2", "v3"}
 
 
 @app.get("/embed-primetent.{version}.js")

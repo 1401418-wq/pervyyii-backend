@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_at TIMESTAMPTZ DEFAULT NOW(),
     user_agent TEXT,
     referrer TEXT,
+    interest TEXT,
     ip TEXT,
     business_niche TEXT,
     tariff_interest TEXT,
