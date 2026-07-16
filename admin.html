@@ -120,6 +120,7 @@ tbody tr:hover { background: rgba(201,168,76,0.04); }
     <div class="stat"><div class="stat-l">За сегодня</div><div class="stat-n" id="s-today">—</div></div>
     <div class="stat"><div class="stat-l">За неделю</div><div class="stat-n" id="s-week">—</div></div>
     <div class="stat"><div class="stat-l">Лидов всего</div><div class="stat-n" id="s-leads">—</div></div>
+    <div class="stat"><div class="stat-l">Новые лиды</div><div class="stat-n" id="s-new-leads">—</div></div>
     <div class="stat"><div class="stat-l">Конверсия</div><div class="stat-n" id="s-conv">—</div></div>
   </div>
 
@@ -217,6 +218,7 @@ function renderStats() {
   document.getElementById('s-today').textContent = s.today ?? 0;
   document.getElementById('s-week').textContent = s.week ?? 0;
   document.getElementById('s-leads').textContent = s.leads ?? 0;
+  document.getElementById('s-new-leads').textContent = (DATA.lead_statuses || {}).new ?? 0;
   const conv = s.total > 0 ? Math.round((s.leads / s.total) * 100) : 0;
   document.getElementById('s-conv').textContent = conv + '%';
 }

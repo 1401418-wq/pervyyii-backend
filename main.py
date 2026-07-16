@@ -2474,11 +2474,17 @@ async def admin_data(request: Request):
                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days') AS week
                FROM sessions"""
         )
+        status_rows = await conn.fetch(
+            """SELECT lead_status, COUNT(*) AS count
+                 FROM sessions WHERE has_lead=TRUE
+                GROUP BY lead_status"""
+        )
         subs = await conn.fetch(
             "SELECT chat_id, username, first_name, subscribed_at FROM telegram_subscribers ORDER BY subscribed_at DESC"
         )
     return {
         "stats": dict(stats) if stats else {},
+        "lead_statuses": {r["lead_status"]: int(r["count"]) for r in status_rows},
         "sessions": [
             {
                 **dict(s),
