@@ -801,6 +801,8 @@ DEMO_SYSTEM = """Ты — Telegram-бот @pervyyii_demo_bot. Живая дем�
 
 pool: asyncpg.Pool | None = None
 _email_retry_task: asyncio.Task | None = None
+_lead_reminder_task: asyncio.Task | None = None
+LEAD_REMINDERS_ENABLED = os.environ.get("LEAD_REMINDERS_ENABLED", "0") == "1"
 
 
 # ─────────────── Telegram polling (РФ: webhook от TG режется РКН, опрашиваем сами через трубу) ───────────────
@@ -859,7 +861,7 @@ async def _start_polling() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global pool, _email_retry_task
+    global pool, _email_retry_task, _lead_reminder_task
     if not DATABASE_URL:
         print("[startup] DATABASE_URL not set — analytics disabled")
         return
@@ -869,6 +871,8 @@ async def startup() -> None:
             await conn.execute("SELECT 1")  # проверка коннекта; схему применяет деплой под agents
         print("[startup] DB pool ready")
         _email_retry_task = asyncio.create_task(_prime_email_retry_loop())
+        if LEAD_REMINDERS_ENABLED:
+            _lead_reminder_task = asyncio.create_task(_prime_lead_reminder_loop())
         if TELEGRAM_POLLING:
             await _start_polling()
         else:
@@ -881,14 +885,16 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global _email_retry_task
-    if _email_retry_task:
-        _email_retry_task.cancel()
-        try:
-            await _email_retry_task
-        except asyncio.CancelledError:
-            pass
-        _email_retry_task = None
+    global _email_retry_task, _lead_reminder_task
+    for task_name in ("_email_retry_task", "_lead_reminder_task"):
+        task = globals().get(task_name)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            globals()[task_name] = None
     if pool:
         await pool.close()
 
@@ -1022,10 +1028,10 @@ async def _alerts_send_to(chat_id: int, text: str, parse_mode: str | None = "HTM
         print(f"[alerts] send to {chat_id} failed: {e}")
 
 
-async def alerts_send(source: str, text: str) -> None:
+async def alerts_send(source: str, text: str) -> bool:
     """Send a message to all subscribers of a specific source. Fire-and-forget."""
     if not (ALERTS_BOT_TOKEN and pool and source):
-        return
+        return False
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -1034,8 +1040,10 @@ async def alerts_send(source: str, text: str) -> None:
             )
         for r in rows:
             await _alerts_send_to(r["chat_id"], text)
+        return bool(rows)
     except Exception as e:
         print(f"[alerts] alerts_send failed: {e}")
+        return False
 
 
 def _send_email_sync(to_addrs, subject, body):
@@ -1114,6 +1122,43 @@ async def _prime_email_retry_loop() -> None:
         except Exception as e:
             print(f"[email] retry loop failed: {type(e).__name__}: {_safe_err(e)}")
         await asyncio.sleep(60)
+
+
+async def _prime_lead_reminder_loop() -> None:
+    """Remind both Prime-Tent alert subscribers about untouched leads once."""
+    while True:
+        try:
+            if pool:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """SELECT session_id, lead_name, lead_contact, business_niche,
+                                  interest, referrer, created_at
+                             FROM sessions
+                            WHERE has_lead=TRUE AND lead_status='new'
+                              AND lead_reminder_sent_at IS NULL
+                              AND created_at < NOW() - INTERVAL '24 hours'
+                              AND referrer LIKE 'prime-tent.ru/%'
+                            ORDER BY created_at LIMIT 20"""
+                    )
+                for row in rows:
+                    text = (
+                        "⏰ <b>Заявка ждёт обработки больше суток</b>\n\n"
+                        f"<b>Имя:</b> {html.escape(str(row['lead_name'] or '—'))}\n"
+                        f"<b>Контакт:</b> {html.escape(str(row['lead_contact'] or '—'))}\n"
+                        f"<b>Интерес:</b> {html.escape(str(row['interest'] or row['business_niche'] or '—'))}\n"
+                        f"<b>Страница:</b> {html.escape(str(row['referrer'] or '—'))}"
+                    )
+                    if await alerts_send("prime-tent", text):
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE sessions SET lead_reminder_sent_at=NOW() WHERE session_id=$1 AND lead_reminder_sent_at IS NULL",
+                                row["session_id"],
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[lead-reminder] failed: {type(e).__name__}: {_safe_err(e)}")
+        await asyncio.sleep(300)
 
 
 @app.post("/alerts/webhook/{secret}")
