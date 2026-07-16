@@ -21,6 +21,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS interest TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS email_notified BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS email_last_error TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_status TEXT NOT NULL DEFAULT 'new';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_status_updated_at TIMESTAMPTZ;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_reminder_sent_at TIMESTAMPTZ;
+ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_lead_status_check;
+ALTER TABLE sessions ADD CONSTRAINT sessions_lead_status_check
+  CHECK (lead_status IN ('new','contacted','in_discussion','quote','won','lost'));
 
 CREATE TABLE IF NOT EXISTS messages (
     id BIGSERIAL PRIMARY KEY,

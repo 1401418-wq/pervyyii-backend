@@ -142,7 +142,7 @@ tbody tr:hover { background: rgba(201,168,76,0.04); }
         <th>Сфера</th>
         <th>Тариф</th>
         <th>Сообщений</th>
-        <th>Лид</th>
+        <th>Лид / этап</th>
         <th class="hide-sm">Контакт</th>
         <th class="hide-sm">IP</th>
         <th>Кратко</th>
@@ -260,12 +260,30 @@ function render() {
       <td>${s.business_niche ? `<span class="tag">${escapeHtml(s.business_niche)}</span>` : '<span class="dim">—</span>'}</td>
       <td>${s.tariff_interest && s.tariff_interest !== 'не определено' ? `<span class="tag gold">${escapeHtml(s.tariff_interest)}</span>` : '<span class="dim">—</span>'}</td>
       <td><span class="mono">${s.msg_count || 0}</span></td>
-      <td>${s.has_lead ? `<span class="tag lead">✓ ${escapeHtml(s.lead_name || 'лид')}</span>` : '<span class="dim">—</span>'}</td>
+      <td>${s.has_lead ? `<span class="tag lead">✓ ${escapeHtml(s.lead_name || 'лид')}</span><br><select class="filter lead-status" data-sid="${escapeHtml(s.session_id)}" onclick="event.stopPropagation()" onchange="setLeadStatus(event)">${statusOptions(s.lead_status)}</select>` : '<span class="dim">—</span>'}</td>
       <td class="hide-sm"><span class="mono">${escapeHtml(s.lead_contact || '—')}</span></td>
       <td class="hide-sm"><span class="mono">${escapeHtml(s.ip || '—')}</span></td>
       <td>${escapeHtml(s.intent_summary ? s.intent_summary.slice(0,120) : '—')}</td>
     </tr>
   `).join('');
+}
+
+function statusOptions(current) {
+  const labels = {new:'Новая', contacted:'Связались', in_discussion:'Обсуждение', quote:'Счёт', won:'Продажа', lost:'Отказ'};
+  return Object.entries(labels).map(([v,l]) => `<option value="${v}" ${v === (current || 'new') ? 'selected' : ''}>${l}</option>`).join('');
+}
+
+async function setLeadStatus(e) {
+  const sid = e.target.dataset.sid;
+  try {
+    const res = await fetch('/admin/session/' + encodeURIComponent(sid) + '/lead-status', {
+      method: 'PATCH', credentials: 'include',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({status: e.target.value}),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await load();
+  } catch (err) { alert('Не удалось изменить этап: ' + err.message); await load(); }
 }
 
 async function openSession(sid) {

@@ -2460,7 +2460,8 @@ async def admin_data(request: Request):
         sessions = await conn.fetch(
             """SELECT session_id, created_at, last_activity_at, msg_count,
                       business_niche, tariff_interest, intent_summary,
-                      has_lead, lead_name, lead_contact, referrer, ip, user_agent
+                      has_lead, lead_name, lead_contact, referrer, ip, user_agent,
+                      lead_status, lead_status_updated_at
                FROM sessions
                ORDER BY created_at DESC
                LIMIT 1000"""
@@ -2483,6 +2484,7 @@ async def admin_data(request: Request):
                 **dict(s),
                 "created_at": s["created_at"].isoformat() if s["created_at"] else None,
                 "last_activity_at": s["last_activity_at"].isoformat() if s["last_activity_at"] else None,
+                "lead_status_updated_at": s["lead_status_updated_at"].isoformat() if s["lead_status_updated_at"] else None,
             }
             for s in sessions
         ],
@@ -2497,6 +2499,34 @@ async def admin_data(request: Request):
             for s in subs
         ],
     }
+
+
+@app.patch("/admin/session/{session_id}/lead-status")
+async def admin_lead_status(session_id: str, request: Request):
+    """Move an existing lead through the sales funnel."""
+    require_admin(request)
+    if not pool:
+        return JSONResponse({"error": "database not configured"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON")
+    status = str(body.get("status") or "").strip().lower()
+    allowed = {"new", "contacted", "in_discussion", "quote", "won", "lost"}
+    if status not in allowed:
+        raise HTTPException(400, "invalid lead status")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE sessions
+                  SET lead_status=$2, lead_status_updated_at=NOW()
+                WHERE session_id=$1 AND has_lead=TRUE
+            RETURNING session_id, lead_status, lead_status_updated_at""",
+            session_id, status,
+        )
+    if not row:
+        raise HTTPException(404, "lead not found")
+    return {"session_id": row["session_id"], "status": row["lead_status"],
+            "updated_at": row["lead_status_updated_at"].isoformat()}
 
 
 @app.delete("/admin/subscriber/{chat_id}")
