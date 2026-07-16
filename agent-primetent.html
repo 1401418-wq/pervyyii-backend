@@ -61,14 +61,15 @@
 
   .input-area {
     padding: 12px 16px; background: #fff; border-top: 1px solid rgba(3,26,46,0.08);
-    display: flex; gap: 9px; align-items: center; flex: none;
+    display: flex; gap: 9px; align-items: flex-end; flex: none;
   }
-  .input-area input {
+  .input-area textarea {
     flex: 1; min-width: 0; border: 1px solid rgba(3,26,46,0.14); background: #f7fafc;
     border-radius: 9px; padding: 11px 13px; font-size: 14px; font-family: inherit;
     color: #10222f; outline: none; transition: border-color 0.15s;
+    resize: none; line-height: 1.4; max-height: 130px; overflow-y: auto;
   }
-  .input-area input:focus { border-color: #12385c; }
+  .input-area textarea:focus { border-color: #12385c; }
   .input-area button {
     background: #12385c; color: #fff; border: none; border-radius: 9px;
     padding: 11px 18px; font-size: 14px; font-weight: 600; font-family: inherit;
@@ -108,7 +109,7 @@
 </div>
 
 <div class="input-area">
-  <input type="text" id="input" placeholder="Напишите сообщение..." autocomplete="off" disabled>
+  <textarea id="input" placeholder="Напишите сообщение..." rows="1" autocomplete="off" disabled></textarea>
   <button id="send" disabled>Отправить</button>
 </div>
 
@@ -185,6 +186,7 @@
     trackEvent("message_sent");
     history.push({ role: "user", content: text });
     inputEl.value = "";
+    inputEl.style.height = "auto";
     setEnabled(false);
     showTyping();
 
@@ -218,7 +220,13 @@
   }
 
   sendBtn.addEventListener("click", send);
-  inputEl.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
+  inputEl.addEventListener("input", function () {
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 130) + "px";
+  });
+  inputEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
 </script>
 
 </body>
