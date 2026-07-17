@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS business_connections (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+
+-- Запросы бесплатного AI-аудита (лид-магнит pervyyii): фиксируем тёплые лиды.
+CREATE TABLE IF NOT EXISTS audit_requests (
+    id BIGSERIAL PRIMARY KEY,
+    url TEXT NOT NULL,
+    ip TEXT,
+    channels TEXT,
+    summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_requests_time ON audit_requests(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_lead ON sessions(has_lead) WHERE has_lead = TRUE;
 CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts_subscribers(source);

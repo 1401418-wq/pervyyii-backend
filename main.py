@@ -3027,6 +3027,24 @@ async def audit(request: Request):
         flush=True,
     )
 
+    # Лид-магнит: запрос аудита = тёплый лид → сохраняем в БД и уведомляем студию
+    summary = (result.get("summary") or "").strip()
+    if pool:
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO audit_requests (url, ip, channels, summary) VALUES ($1, $2, $3, $4)",
+                    url, ip, channels_line, summary[:500],
+                )
+        except Exception as e:
+            print(f"[audit] save failed: {_safe_err(e)}")
+    await tg_send(
+        "🔍 <b>Запрос AI-аудита сайта</b>\n"
+        f"Сайт: {html.escape(url)}\n"
+        f"Каналы связи на сайте: {html.escape(channels_line)}\n"
+        f"Итог аудита: {html.escape(summary[:300]) or '—'}"
+    )
+
     return JSONResponse({
         "url": url,
         **result,
