@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="format-detection" content="telephone=no">
+<title>Помощник ПРАЙМ-ТЕНТ</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+    background: #f2f5f8;
+    color: #10222f;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  .header {
+    padding: 16px 20px;
+    background: #031a2e;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: none;
+  }
+  .avatar {
+    width: 38px; height: 38px; border-radius: 50%;
+    background: #12385c; color: #cfe2f2;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; letter-spacing: 0.5px; flex: none;
+  }
+  .header-info h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
+  .header-info p { font-size: 12px; color: #9db6cc; margin-top: 2px; }
+  .messages {
+    flex: 1; overflow-y: auto; padding: 20px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .message {
+    max-width: 86%; padding: 11px 15px; border-radius: 12px;
+    font-size: 14px; line-height: 1.55; word-wrap: break-word; white-space: pre-wrap;
+  }
+  .message.bot { align-self: flex-start; background: #fff; color: #10222f; border: 1px solid rgba(3,26,46,0.08); }
+  .message.user { align-self: flex-end; background: #12385c; color: #fff; }
+  .typing { align-self: flex-start; padding: 13px 16px; background: #fff; border: 1px solid rgba(3,26,46,0.08); border-radius: 12px; display: flex; gap: 4px; }
+  .typing span { width: 6px; height: 6px; background: #8aa6bd; border-radius: 50%; animation: bounce 1.4s infinite ease-in-out; }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce { 0%,80%,100% { opacity: 0.3; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-4px); } }
+
+  .consent {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 10px 16px; background: #eaf0f6; border-top: 1px solid rgba(3,26,46,0.08);
+    font-size: 12px; color: #4a6379; line-height: 1.4; flex: none;
+  }
+  .consent input { margin-top: 2px; width: 15px; height: 15px; flex: none; accent-color: #12385c; cursor: pointer; }
+  .consent label { cursor: pointer; flex: 1; min-width: 0; }
+  .consent a { color: #12385c; }
+
+  .voice-status {
+    display: none; align-items: center; gap: 8px;
+    padding: 8px 16px; background: #fff; border-top: 1px solid rgba(3,26,46,0.08);
+    font-size: 12.5px; color: #4a6379; flex: none;
+  }
+  .voice-status.on { display: flex; }
+  .voice-status .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: #d13b30; flex: none;
+    animation: pulse 1.2s infinite ease-in-out;
+  }
+  .voice-status.thinking .dot { background: #12385c; }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.75); } }
+  .voice-status .hint { margin-left: auto; color: #90a4b5; font-size: 11.5px; }
+
+  .input-area {
+    padding: 12px 16px; background: #fff; border-top: 1px solid rgba(3,26,46,0.08);
+    display: flex; gap: 9px; align-items: flex-end; flex: none;
+  }
+  .input-area textarea {
+    flex: 1; min-width: 0; border: 1px solid rgba(3,26,46,0.14); background: #f7fafc;
+    border-radius: 9px; padding: 11px 13px; font-size: 14px; font-family: inherit;
+    color: #10222f; outline: none; transition: border-color 0.15s;
+    resize: none; line-height: 1.4; max-height: 130px; overflow-y: auto;
+  }
+  .input-area textarea:focus { border-color: #12385c; }
+  .input-area button {
+    background: #12385c; color: #fff; border: none; border-radius: 9px;
+    padding: 11px 18px; font-size: 14px; font-weight: 600; font-family: inherit;
+    cursor: pointer; transition: opacity 0.15s; flex: none;
+  }
+  .input-area button:hover { opacity: 0.9; }
+  .input-area button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  #mic {
+    padding: 0; width: 42px; height: 42px; border-radius: 50%;
+    background: #eaf0f6; color: #12385c; display: none;
+    align-items: center; justify-content: center; flex: none;
+    transition: background 0.15s, color 0.15s, transform 0.1s;
+  }
+  #mic.available { display: flex; }
+  #mic:hover:not(:disabled) { background: #dde7f0; opacity: 1; }
+  #mic:active:not(:disabled) { transform: scale(0.94); }
+  #mic svg { width: 20px; height: 20px; fill: currentColor; pointer-events: none; }
+  #mic.recording { background: #d13b30; color: #fff; animation: micPulse 1.4s infinite ease-in-out; }
+  #mic.recording:hover { background: #b9332a; }
+  @keyframes micPulse { 0%,100% { box-shadow: 0 0 0 0 rgba(209,59,48,0.45); } 50% { box-shadow: 0 0 0 7px rgba(209,59,48,0); } }
+
+  .powered {
+    text-align: center; padding: 7px; background: #fff; flex: none;
+    font-size: 11px; color: #90a4b5; border-top: 1px solid rgba(3,26,46,0.05);
+  }
+  .powered a { color: #6b8299; text-decoration: none; }
+  .powered a:hover { text-decoration: underline; }
+
+  .messages::-webkit-scrollbar { width: 6px; }
+  .messages::-webkit-scrollbar-thumb { background: rgba(3,26,46,0.15); border-radius: 3px; }
+
+  /* на узком экране микрофон отъедает ширину у поля — поджимаем отступы, чтобы не резало текст */
+  @media (max-width: 430px) {
+    .input-area { padding: 10px 12px; gap: 7px; }
+    .input-area #send { padding: 11px 13px; font-size: 13.5px; }
+    #mic { width: 40px; height: 40px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="avatar">ИИ</div>
+  <div class="header-info">
+    <h1>Помощник ПРАЙМ-ТЕНТ</h1>
+    <p>Отвечу по тентовым сооружениям</p>
+  </div>
+</div>
+
+<div class="messages" id="messages">
+  <div class="message bot">Здравствуйте! Я ИИ-помощник компании ПРАЙМ-ТЕНТ. Готов немедленно помочь Вам в выборе нашей продукции, ответить на все вопросы по ней и сделать предварительный расчёт интересующего Вас тентового сооружения.</div>
+</div>
+
+<div class="consent">
+  <input type="checkbox" id="consent">
+  <label for="consent">Соглашаюсь с обработкой персональных данных согласно <a href="https://prime-tent.ru/privacy.html" target="_blank" rel="noopener">Политике</a></label>
+</div>
+
+<div class="voice-status" id="voiceStatus">
+  <span class="dot"></span>
+  <span id="voiceText">Говорите...</span>
+  <span class="hint" id="voiceHint">нажмите ещё раз, чтобы закончить</span>
+</div>
+
+<div class="input-area">
+  <button id="mic" title="Наговорить сообщение" aria-label="Наговорить сообщение" disabled>
+    <svg viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M18 12a1 1 0 0 0-2 0 4 4 0 0 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V20H9a1 1 0 0 0 0 2h6a1 1 0 0 0 0-2h-2v-2.09A6 6 0 0 0 18 12z"/></svg>
+  </button>
+  <textarea id="input" placeholder="Сообщение..." rows="1" autocomplete="off" disabled></textarea>
+  <button id="send" disabled>Отправить</button>
+</div>
+
+<div class="powered">
+  Демонстрация надиктовки голосом &middot; Работает на <a href="https://pervyyii.ru" target="_blank" rel="noopener">Первом ИИ</a>
+</div>
+
+<script>
+  const API_URL = "chat"; // относительный: работает и локально (/chat), и под префиксом /api/hub/chat
+  const messagesEl = document.getElementById("messages");
+  const inputEl = document.getElementById("input");
+  const sendBtn = document.getElementById("send");
+  const micBtn = document.getElementById("mic");
+  const consentEl = document.getElementById("consent");
+  const voiceStatusEl = document.getElementById("voiceStatus");
+  const voiceTextEl = document.getElementById("voiceText");
+  const voiceHintEl = document.getElementById("voiceHint");
+  const history = [];
+
+  // Страница-источник (передаётся из embed.js через ?ref=)
+  const params = new URLSearchParams(location.search);
+  const referrer = params.get("ref") || document.referrer || "";
+  const interest = (params.get("interest") || "").slice(0, 80);
+
+  // Стабильный session_id на сессию — для серверной истории диалога
+  // Демо-сессии помечены префиксом, чтобы отличать их от живых диалогов клиента.
+  let sessionId = sessionStorage.getItem("pt_voice_demo_sid");
+  if (!sessionId) {
+    sessionId = "voicedemo-" + (crypto.randomUUID ? crypto.randomUUID()
+      : String(Date.now()) + Math.random().toString(16).slice(2));
+    sessionStorage.setItem("pt_voice_demo_sid", sessionId);
+  }
+  // Воронку клиента демо не засоряет — события не шлём.
+  function trackEvent() {}
+
+  function setEnabled(on) {
+    inputEl.disabled = !on;
+    sendBtn.disabled = !on;
+    micBtn.disabled = !on || recording;
+  }
+  consentEl.addEventListener("change", function () {
+    setEnabled(consentEl.checked);
+    if (consentEl.checked) { trackEvent("consent_given"); inputEl.focus(); }
+    else if (recording) stopRecording(false);
+  });
+
+  function addMessage(text, who) {
+    const div = document.createElement("div");
+    div.className = "message " + who;
+    div.textContent = text;
+    messagesEl.appendChild(div);
+    if (who === "bot") {
+      // длинный ответ показываем с НАЧАЛА, а не с конца — верх сообщения к верху окна
+      const mRect = messagesEl.getBoundingClientRect();
+      const dRect = div.getBoundingClientRect();
+      messagesEl.scrollTop += (dRect.top - mRect.top) - 8;
+    } else {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+  }
+  function showTyping() {
+    const div = document.createElement("div");
+    div.className = "typing"; div.id = "typing";
+    div.innerHTML = "<span></span><span></span><span></span>";
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+  function hideTyping() { const t = document.getElementById("typing"); if (t) t.remove(); }
+
+  async function send() {
+    if (!consentEl.checked) return;
+    const text = inputEl.value.trim();
+    if (!text) return;
+
+    addMessage(text, "user");
+    trackEvent("message_sent");
+    history.push({ role: "user", content: text });
+    inputEl.value = "";
+    inputEl.style.height = "auto";
+    setEnabled(false);
+    showTyping();
+
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: history,
+          session_id: sessionId,
+          client: "prime-tent",
+          referrer: referrer,
+          interest: interest
+        })
+      });
+      const data = await res.json();
+      hideTyping();
+      if (data.reply) {
+        addMessage(data.reply, "bot");
+        history.push({ role: "assistant", content: data.reply });
+      } else {
+        addMessage("Извините, что-то пошло не так. Попробуйте позже или свяжитесь с нами напрямую.", "bot");
+      }
+    } catch (e) {
+      hideTyping();
+      addMessage("Нет связи. Проверьте интернет и попробуйте снова.", "bot");
+    } finally {
+      setEnabled(true);
+      inputEl.focus();
+    }
+  }
+
+  sendBtn.addEventListener("click", send);
+  inputEl.addEventListener("input", function () {
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 130) + "px";
+  });
+  inputEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+
+  // ─────────────── Надиктовка голосом ───────────────
+  // Пишем сырой PCM через Web Audio API и отправляем как LPCM 16 кГц моно.
+  // MediaRecorder не годится: в Safari/iOS он выдаёт mp4/aac, который SpeechKit не принимает.
+
+  const MAX_SECONDS = 25; // потолок SpeechKit v1 — 1 МБ на запрос
+  const TARGET_RATE = 16000;
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const micSupported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && AudioCtx);
+
+  let recording = false, audioCtx = null, micStream = null, processor = null,
+      sourceNode = null, pcmChunks = [], recordedFrames = 0, countdownTimer = null;
+
+  if (micSupported) micBtn.classList.add("available");
+
+  function showStatus(text, hint, thinking) {
+    voiceTextEl.textContent = text;
+    voiceHintEl.textContent = hint || "";
+    voiceStatusEl.classList.toggle("thinking", !!thinking);
+    voiceStatusEl.classList.add("on");
+  }
+  function hideStatus() { voiceStatusEl.classList.remove("on", "thinking"); }
+
+  function downsampleToInt16(chunks, frames, fromRate) {
+    const flat = new Float32Array(frames);
+    let offset = 0;
+    for (const c of chunks) { flat.set(c, offset); offset += c.length; }
+
+    const ratio = fromRate / TARGET_RATE;
+    const outLength = Math.floor(flat.length / ratio);
+    const out = new Int16Array(outLength);
+    for (let i = 0; i < outLength; i++) {
+      // усредняем окно исходных отсчётов — дешёвый антиалиасинг
+      const start = Math.floor(i * ratio);
+      const end = Math.min(Math.floor((i + 1) * ratio), flat.length);
+      let sum = 0, n = 0;
+      for (let j = start; j < end; j++) { sum += flat[j]; n++; }
+      const sample = n ? sum / n : 0;
+      const clamped = Math.max(-1, Math.min(1, sample));
+      out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    }
+    // SpeechKit ждёт signed 16-bit little-endian без заголовка — задаём порядок байт явно,
+    // а не полагаемся на порядок байт платформы.
+    const bytes = new Uint8Array(out.length * 2);
+    const view = new DataView(bytes.buffer);
+    for (let i = 0; i < out.length; i++) view.setInt16(i * 2, out[i], true);
+    return bytes;
+  }
+
+  function releaseMic() {
+    if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+    if (processor) { try { processor.disconnect(); } catch (_) {} processor.onaudioprocess = null; processor = null; }
+    if (sourceNode) { try { sourceNode.disconnect(); } catch (_) {} sourceNode = null; }
+    if (micStream) { micStream.getTracks().forEach(function (t) { t.stop(); }); micStream = null; }
+    if (audioCtx) { const ctx = audioCtx; audioCtx = null; try { ctx.close(); } catch (_) {} }
+  }
+
+  async function startRecording() {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      });
+    } catch (e) {
+      hideStatus();
+      addMessage("Не получилось включить микрофон. Разрешите доступ в настройках браузера или напишите текстом.", "bot");
+      return;
+    }
+
+    audioCtx = new AudioCtx();
+    if (audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (_) {} }
+
+    pcmChunks = [];
+    recordedFrames = 0;
+    sourceNode = audioCtx.createMediaStreamSource(micStream);
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = function (e) {
+      if (!recording) return;
+      pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      recordedFrames += e.inputBuffer.length;
+    };
+    sourceNode.connect(processor);
+    processor.connect(audioCtx.destination); // без выхода ScriptProcessor не тикает; буфер не заполняем — тишина
+
+    recording = true;
+    micBtn.classList.add("recording");
+    micBtn.title = "Остановить запись";
+
+    let left = MAX_SECONDS;
+    showStatus("Говорите... " + left, "нажмите ещё раз, чтобы закончить");
+    countdownTimer = setInterval(function () {
+      left -= 1;
+      if (left <= 0) { stopRecording(true); return; }
+      voiceTextEl.textContent = "Говорите... " + left;
+    }, 1000);
+  }
+
+  async function stopRecording(transcribe) {
+    if (!recording) return;
+    recording = false;
+    micBtn.classList.remove("recording");
+    micBtn.title = "Наговорить сообщение";
+
+    const rate = audioCtx ? audioCtx.sampleRate : TARGET_RATE;
+    const chunks = pcmChunks, frames = recordedFrames;
+    pcmChunks = [];
+    recordedFrames = 0;
+    releaseMic();
+
+    if (!transcribe || !frames) { hideStatus(); micBtn.disabled = !consentEl.checked; return; }
+
+    showStatus("Распознаю...", "", true);
+    micBtn.disabled = true;
+
+    try {
+      const pcm = downsampleToInt16(chunks, frames, rate);
+      const res = await fetch("stt?client=prime-tent-voice-demo", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: pcm
+      });
+      const data = await res.json();
+      hideStatus();
+      if (data.text) {
+        const existing = inputEl.value.trim();
+        inputEl.value = existing ? existing + " " + data.text : data.text;
+        inputEl.dispatchEvent(new Event("input"));
+        inputEl.focus();
+      } else {
+        showStatus("Не разобрал — попробуйте ещё раз или напишите текстом", "", true);
+        setTimeout(hideStatus, 3500);
+      }
+    } catch (e) {
+      hideStatus();
+      addMessage("Не удалось распознать голос. Напишите, пожалуйста, текстом.", "bot");
+    } finally {
+      micBtn.disabled = !consentEl.checked;
+    }
+  }
+
+  micBtn.addEventListener("click", function () {
+    if (!consentEl.checked) return;
+    if (recording) stopRecording(true);
+    else startRecording();
+  });
+</script>
+
+</body>
+</html>

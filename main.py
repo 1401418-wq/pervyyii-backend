@@ -2159,6 +2159,96 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
         print(f"[extract] failed for {session_id}: {e}")
 
 
+# ─────────────────── Надиктовка голосом в виджете (Яндекс SpeechKit, РФ) ───────────────────
+
+# Потолок SpeechKit v1 — 1 МБ на запрос. 25 сек LPCM 16 кГц моно ≈ 800 КБ.
+_STT_MAX_BYTES = 1_000_000
+_STT_MIN_BYTES = 3200  # 0,1 сек — случайное касание кнопки
+
+# Демо для показа клиенту ходит под своим именем: свои лимиты и своя статистика,
+# боевой prime-tent не задевает.
+_STT_CLIENTS = {"prime-tent", "prime-tent-voice-demo"}
+
+# Распознавание платное: помимо часовых лимитов держим суточный потолок и не даём
+# запускать много параллельных распознаваний одновременно.
+_stt_inflight = asyncio.Semaphore(4)
+
+
+async def _stt_recognize(audio: bytes) -> str | None:
+    """LPCM 16 кГц моно → текст. Аудио нигде не сохраняется, только транзит."""
+    if not (YC_API_KEY and YC_FOLDER):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize",
+                params={
+                    "folderId": YC_FOLDER,
+                    "lang": "ru-RU",
+                    "format": "lpcm",
+                    "sampleRateHertz": 16000,
+                },
+                headers={"Authorization": f"Api-Key {YC_API_KEY}"},
+                content=audio,
+            )
+        if resp.status_code != 200:
+            print(f"[stt] yandex failed: {resp.status_code} {resp.text[:200]}")
+            return None
+        return (resp.json().get("result") or "").strip() or None
+    except Exception as e:
+        print(f"[stt] failed: {_safe_err(e)}")
+        return None
+
+
+@app.post("/stt")
+async def stt(request: Request):
+    origin = request.headers.get("origin", "")
+    if origin and origin not in _ALLOWED_CHAT_ORIGINS:
+        return JSONResponse({"error": "forbidden origin"}, status_code=403)
+
+    client_name = str(request.query_params.get("client") or "")[:32].strip().lower()
+    if client_name not in _STT_CLIENTS:
+        return JSONResponse({"error": "unknown client"}, status_code=400)
+    referrer = _sanitize_referrer(request.query_params.get("ref") or "")
+    if not _client_ref_allowed(client_name, referrer):
+        return JSONResponse({"error": "client/referrer mismatch"}, status_code=403)
+
+    ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if ctype and ctype != "application/octet-stream":
+        return JSONResponse({"error": "unsupported media type"}, status_code=415)
+
+    # STT платный — лимиты жёстче чата, плюс суточный потолок на случай упорного абьюза.
+    ip = _client_ip(request)
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown"):
+        if _rate_limited(f"stt:{client_name}:{ip}", limit=30, window=3600):
+            return JSONResponse({"error": "Слишком много записей. Попробуйте позже."}, status_code=429)
+        if _rate_limited(f"stt:day:{client_name}:{ip}", limit=100, window=86400):
+            return JSONResponse({"error": "Слишком много записей. Попробуйте позже."}, status_code=429)
+    if _rate_limited(f"stt:client:{client_name}", limit=100, window=3600):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте позже."}, status_code=429)
+    if _rate_limited("stt:_global", limit=300, window=3600):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте позже."}, status_code=429)
+    if _rate_limited("stt:_global_day", limit=2000, window=86400):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте позже."}, status_code=429)
+
+    # Читаем потоком и рвём на превышении: content-length можно не прислать (chunked).
+    audio = bytearray()
+    async for chunk in request.stream():
+        audio.extend(chunk)
+        if len(audio) > _STT_MAX_BYTES:
+            return JSONResponse({"error": "too large"}, status_code=413)
+    if len(audio) < _STT_MIN_BYTES:
+        return {"text": None}
+
+    if _stt_inflight.locked():
+        return JSONResponse({"error": "Сервис занят, попробуйте через секунду."}, status_code=429)
+    async with _stt_inflight:
+        text = await _stt_recognize(bytes(audio))
+    # В лог только размеры: ни аудио, ни распознанный текст не сохраняем.
+    print(f"[stt] {client_name}: {len(audio)} bytes -> {len(text or '')} chars")
+    return {"text": text}
+
+
 # ─────────────────── Обезличенная аналитика виджета ───────────────────
 
 @app.post("/widget-events")
@@ -3073,6 +3163,16 @@ async def agent_primetent_page():
     # frame-ancestors управляется централизованно в nginx (per-client allowlist).
     # Для установки на prime-tent.ru добавить домен в nginx CSP.
     return FileResponse("agent-primetent.html")
+
+
+@app.get("/agent-primetent-voice.html")
+async def agent_primetent_voice_page():
+    # Демо надиктовки голосом для показа клиенту. Боевой виджет не трогает.
+    # Открывается прямой ссылкой, встраивать в чужие страницы незачем.
+    return FileResponse(
+        "agent-primetent-voice.html",
+        headers={"Content-Security-Policy": "frame-ancestors 'none'"},
+    )
 
 
 @app.get("/embed-primetent.js")
