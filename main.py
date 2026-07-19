@@ -3040,8 +3040,13 @@ async def audit(request: Request):
     if parsed["has_chat_widget"]: channels.append("сторонний чат-виджет")
     channels_line = ", ".join(channels) if channels else "ничего из этого не найдено"
 
+    # В промпт — только схема, хост и путь: query и fragment могут нести ПД
+    # (?phone=, ?email=, токены), а модели для аудита они не нужны.
+    _u = urlparse(url)
+    url_for_prompt = urlunparse((_u.scheme, _u.netloc, _u.path, "", "", ""))
+
     user_message = (
-        f"URL: {url}\n"
+        f"URL: {url_for_prompt}\n"
         f"Title: {parsed['title']}\n"
         f"Meta description: {parsed['meta_desc']}\n"
         f"H1: {' | '.join(parsed['h1s']) or '(нет)'}\n"
@@ -3049,6 +3054,10 @@ async def audit(request: Request):
         f"Каналы связи на странице: {channels_line}.\n\n"
         f"{source_note}:\n{body_for_prompt}"
     )
+    # За границу уходит только обезличенный текст: наличие каналов связи уже
+    # посчитано локально выше (channels_line), сами контакты модели не нужны.
+    audit_pii: dict = {}
+    user_message = _mask_pii(user_message, audit_pii)
 
     async def call_model(extra_hint: str = "") -> tuple[dict | None, dict, int]:
         try:
@@ -3102,7 +3111,7 @@ async def audit(request: Request):
         if "error" in data:
             return JSONResponse({"error": data["error"]}, status_code=status or 500)
         parts = [b.get("text", "") for b in (data.get("content") or []) if b.get("type") == "text"]
-        result = extract_json("".join(parts))
+        result = extract_json(_unmask("".join(parts), audit_pii))
         if result and isinstance(result.get("problems"), list) and result["problems"]:
             break
 
