@@ -1880,40 +1880,67 @@ _PT_SEP_SHATER = "Отдельно считаются: монтаж, доста�
 _PT_SEP_GIPAR = "Отдельно считаются: монтаж, доставка, фундаменты (сваи под стойки и закладные оттяжек)."
 _PT_SEP_VOZDUH = "Отдельно считаются: доставка, командировочные, фундамент."
 
-# Соответствие диаметра купола цирка → диапазон числа мест (данные ПРАЙМ-ТЕНТ). Места зависят
-# от диаметра купола и компоновки проходов; НЕ зависят от высоты купола и наклона трибун.
-_CIRCUS_SEATS = [
-    (24, 550, 600), (25, 600, 650), (28, 700, 800), (30, 800, 950),
-    (32, 1000, 1100), (34, 1100, 1150), (36, 1150, 1250), (38, 1300, 1500),
-    (42, 1800, 1900), (44, 2000, 2100), (46, 2100, 2200), (48, 2500, 2500),
-]
+# Коэффициенты ПРАЙМ-ТЕНТ (документ Сергея «Формулы ценообразования продуктов», 20.07.2026).
+# M — цена за 1 кг металла, T — за м² тента, I — за м² утеплителя,
+# m — металлоёмкость каркаса на м² полезной площади, t — расход тента на м² полезной площади.
+_PT_M_PAINT, _PT_M_ZINC = 210.0, 300.0
+_PT_I_INSUL = 750.0
+# Металл по умолчанию, если клиент не уточнил (решение Сергея 20.07): холодным ангарам покраска,
+# всему остальному оцинковка.
+_PT_METAL_DEFAULT = {
+    "angar_cold": _PT_M_PAINT,
+    "angar_warm": _PT_M_ZINC,
+    "membrannoe_arochnoe": _PT_M_ZINC,
+    "shater_restaurant": _PT_M_ZINC,
+    "gipar": _PT_M_ZINC,
+}
+# Гипары: 15 на оттяжках, 30 на стационарных стойках. Если клиент не уточнил — среднее 23.
+_PT_GIPAR_M = {"ottyazhki": 15.0, "statsionar": 30.0}
+_PT_GIPAR_M_DEFAULT = 23.0
+
+# Цирк: связь числа мест и площади купола, Q = k × S (документ Сергея). Диаметр из мест — обратная
+# формула D = sqrt(4Q / (k·π)). Места НЕ зависят от высоты купола и наклона трибун.
+_PT_CIRCUS_K = 1.25
+_PT_CIRCUS_D_MIN, _PT_CIRCUS_D_MAX = 24.0, 48.0
+
+
+def _circus_area(d):
+    return math.pi * d * d / 4.0
 
 
 def _circus_seats_for_diameter(d):
-    tbl = _CIRCUS_SEATS
-    if d <= tbl[0][0]:
-        return tbl[0][1], tbl[0][2]
-    if d >= tbl[-1][0]:
-        return tbl[-1][1], tbl[-1][2]
-    for i in range(len(tbl) - 1):
-        d0, l0, h0 = tbl[i]
-        d1, l1, h1 = tbl[i + 1]
-        if d0 <= d <= d1:
-            t = (d - d0) / (d1 - d0) if d1 != d0 else 0
-            return int(round(l0 + t * (l1 - l0))), int(round(h0 + t * (h1 - h0)))
-    return tbl[-1][1], tbl[-1][2]
+    """Ориентир вместимости по диаметру купола. Отдаём вилку ±8% — компоновка проходов и
+    ширина манежа гуляют, точное число даёт менеджер."""
+    q = _PT_CIRCUS_K * _circus_area(d)
+    return int(round(q * 0.92)), int(round(q * 1.08))
 
 
 def _circus_diameter_for_seats(n):
-    for d, l, h in _CIRCUS_SEATS:
-        if h >= n:
-            return d
-    return _CIRCUS_SEATS[-1][0]
+    d = math.sqrt(4.0 * n / (_PT_CIRCUS_K * math.pi))
+    return min(max(d, _PT_CIRCUS_D_MIN), _PT_CIRCUS_D_MAX)
+
+
+def _pt_frame_cost(area, perim, wall_height, metal, m, tent, t, insulated=False):
+    """Каркасно-тентовое сооружение по формулам Сергея.
+
+    Каркас: M·S·m. Тент кровли: T·S·t. Тент стен: T·((a+b)·2·(h+0,75)).
+    У утеплённых тенты идут в два слоя и добавляется утеплитель по кровле и стенам.
+    """
+    wall_area = perim * (wall_height + 0.75) if (perim and wall_height) else 0.0
+    frame = metal * area * m
+    roof = tent * area * t
+    walls = tent * wall_area
+    if insulated:
+        roof *= 2
+        walls *= 2
+        roof += _PT_I_INSUL * area * t
+        walls += _PT_I_INSUL * wall_area
+    return frame + roof + walls
 
 
 def pt_calculate_price(construction=None, width=None, length=None, wall_height=None,
                        area=None, with_walls=False, shade_area=None,
-                       dome_diameter=None, seats=None, **_):
+                       dome_diameter=None, seats=None, metal=None, gipar_mount=None, **_):
     def _num(x, lo, hi):
         """Конечное положительное число в [lo, hi]; иначе None (режет отрицательные, NaN, Inf, гигантские)."""
         try:
@@ -1944,29 +1971,38 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         return None
 
     c = construction
+    metal_key = str(metal or "").strip().lower()
+    metal_rate = {"pokraska": _PT_M_PAINT, "otsinkovka": _PT_M_ZINC}.get(metal_key)
+    metal_assumed = metal_rate is None
+    if metal_assumed:
+        metal_rate = _PT_METAL_DEFAULT.get(c, _PT_M_ZINC)
+    metal_note = ""
+    if metal_assumed and c in _PT_METAL_DEFAULT:
+        kind = "покраске" if metal_rate == _PT_M_PAINT else "оцинковке"
+        metal_note = f" Посчитано по {kind} — уточни у клиента, покраска или оцинковка, цифра изменится."
+
     if c in ("angar_cold", "angar_warm"):
         a, pm = _area(), _perim()
         if not (a and pm and wall_height):
             return {"ok": False, "need": "положительные ширина, длина и высота стен ангара"}
-        base = a * 8000 + 90000 + pm * wall_height * 1500
-        if c == "angar_warm":
-            base *= 1.35
-        total = base * 1.40
-        kind = "утеплённого" if c == "angar_warm" else "холодного"
-        return {"ok": True, "text": f"Ориентир {kind} ангара: порядка {_rub(total)} рублей С МОНТАЖОМ (за само сооружение с монтажом). {_PT_SEP_ANGAR}"}
+        warm = c == "angar_warm"
+        make = _pt_frame_cost(a, pm, wall_height, metal_rate, 22.0, 900.0, 1.5, insulated=warm)
+        total = make * (1.40 if warm else 1.35)
+        kind = "утеплённого" if warm else "холодного"
+        return {"ok": True, "text": f"Ориентир {kind} ангара: порядка {_rub(total)} рублей С МОНТАЖОМ (изготовление плюс монтаж). {_PT_SEP_ANGAR}{metal_note}"}
 
-    if c == "shater_restaurant":
+    if c in ("shater_restaurant", "membrannoe_arochnoe"):
         a, pm = _area(), _perim()
         if not a:
-            return {"ok": False, "need": "положительные ширина и длина (или площадь) шатра/павильона"}
-        lo, hi = a * 11000 + 90000, a * 13000 + 90000
-        if with_walls:
-            if not (pm and wall_height):
-                return {"ok": False, "need": "положительная высота стен (для варианта со стенами)"}
-            w = pm * wall_height * 1500
-            lo += w
-            hi += w
-        return {"ok": True, "text": f"Ориентир шатра/павильона: порядка {_rub_range(lo, hi)} рублей за само сооружение. {_PT_SEP_SHATER}"}
+            return {"ok": False, "need": "положительные ширина и длина (или площадь) сооружения"}
+        # Шатровые конусообразные с центральными стойками расходуют больше тента, чем арочные.
+        t_coef = 2.0 if c == "shater_restaurant" else 1.5
+        if with_walls and not (pm and wall_height):
+            return {"ok": False, "need": "положительная высота стен (для варианта со стенами)"}
+        wall_h = wall_height if with_walls else None
+        make = _pt_frame_cost(a, pm if with_walls else 0.0, wall_h, metal_rate, 17.0, 1600.0, t_coef)
+        name = "шатра/павильона" if c == "shater_restaurant" else "арочной мембранной конструкции"
+        return {"ok": True, "text": f"Ориентир {name}: порядка {_rub(make)} рублей за изготовление. {_PT_SEP_SHATER}{metal_note}"}
 
     if c == "vozduhoopornoe":
         a = _area()
@@ -1978,12 +2014,19 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         s = shade_area or _area()
         if not s:
             return {"ok": False, "need": "положительная площадь зоны тени"}
-        return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub_range(s * 7500, s * 10000)} рублей за само сооружение. Стен у гипаров не бывает. {_PT_SEP_GIPAR}"}
+        mount = str(gipar_mount or "").strip().lower()
+        m_coef = _PT_GIPAR_M.get(mount)
+        mount_note = ""
+        if m_coef is None:
+            m_coef = _PT_GIPAR_M_DEFAULT
+            mount_note = " Посчитано по среднему варианту опор — уточни, оттяжки или стационарные стойки на фундаменте, цифра изменится."
+        make = _pt_frame_cost(s, 0.0, None, metal_rate, m_coef, 1900.0, 1.4)
+        return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub(make)} рублей за изготовление. Стен у гипаров не бывает. {_PT_SEP_GIPAR}{metal_note}{mount_note}"}
 
     if c == "circus":
-        max_seats = _CIRCUS_SEATS[-1][2]
+        max_seats = _circus_seats_for_diameter(_PT_CIRCUS_D_MAX)[1]
         d = dome_diameter
-        if d is not None and not (24 <= d <= 48):
+        if d is not None and not (_PT_CIRCUS_D_MIN <= d <= _PT_CIRCUS_D_MAX):
             return {"ok": False, "need": "стандартные купола ПРАЙМ-ТЕНТ — диаметром 24–48 м; для другого диаметра нужен расчёт менеджера"}
         if seats and not d:
             if seats > max_seats:
@@ -1992,7 +2035,7 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         parts = []
         total = 0
         if d:
-            dome_price = (d * d * 3.14 / 4) * 16500
+            dome_price = _circus_area(d) * 16500
             total += dome_price
             parts.append(f"купол Ø{int(round(d))} м с опорными конструкциями — порядка {_rub(dome_price)} рублей")
         if seats:
@@ -2023,7 +2066,9 @@ _PT_PRICE_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "construction": {"type": "string", "enum": ["shater_restaurant", "angar_cold", "angar_warm", "vozduhoopornoe", "gipar", "circus"], "description": "shater_restaurant — шатёр/тент/павильон для ресторана/кафе/площадки; angar_cold — холодный ангар; angar_warm — утеплённый ангар; vozduhoopornoe — воздухоопорное; gipar — мембранный теневой парус; circus — цирк-шапито."},
+            "construction": {"type": "string", "enum": ["shater_restaurant", "membrannoe_arochnoe", "angar_cold", "angar_warm", "vozduhoopornoe", "gipar", "circus"], "description": "shater_restaurant — шатёр/павильон конусообразный с центральными стойками (ресторан, кафе, площадка); membrannoe_arochnoe — арочная мембранная конструкция; angar_cold — холодный ангар/каркасно-тентовое; angar_warm — утеплённый ангар; vozduhoopornoe — воздухоопорное; gipar — натяжной мембранный парус-гипар; circus — цирк-шапито."},
+            "metal": {"type": "string", "enum": ["pokraska", "otsinkovka"], "description": "Металл каркаса: pokraska — в покраске (дешевле), otsinkovka — оцинкованный. СПРОСИ у клиента. Без ответа считается по умолчанию: холодный ангар в покраске, остальное оцинковка."},
+            "gipar_mount": {"type": "string", "enum": ["ottyazhki", "statsionar"], "description": "Только для гипара: ottyazhki — стойки с оттяжками (дешевле), statsionar — стационарные стойки на фундаменте (дороже вдвое). СПРОСИ у клиента; без ответа берётся среднее."},
             "width": {"type": "number", "minimum": 1, "maximum": 500, "description": "Ширина, м"},
             "length": {"type": "number", "minimum": 1, "maximum": 500, "description": "Длина, м"},
             "wall_height": {"type": "number", "minimum": 1, "maximum": 50, "description": "Высота стен, м (ангар; шатёр со стенами)"},
