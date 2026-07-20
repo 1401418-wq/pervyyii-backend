@@ -1878,6 +1878,10 @@ def _rub_range(lo: float, hi: float) -> str:
 _PT_SEP_ANGAR = "Отдельно менеджер считает: ворота, фундамент/основание, доставку, командировочные."
 _PT_SEP_SHATER = "Отдельно считаются: монтаж, доставка, фундамент/основание."
 _PT_SEP_GIPAR = "Отдельно считаются: монтаж, доставка, фундаменты (сваи под стойки и закладные оттяжек)."
+# У мембранных и гипаров монтаж в цену НЕ входит (решение Сергея: нетипичные изделия). Без явной
+# оговорки клиент принимает сумму за цену под ключ — предупреждение обязательно в каждом ответе.
+_PT_NO_MONTAGE = ("Это ориентировочная стоимость ИЗГОТОВЛЕНИЯ без монтажа, доставки, фундамента "
+                  "и дополнительных работ. Точный состав и итоговую цену подтверждает менеджер.")
 _PT_SEP_VOZDUH = "Отдельно считаются: доставка, командировочные, фундамент."
 
 # Коэффициенты ПРАЙМ-ТЕНТ (документ Сергея «Формулы ценообразования продуктов», 20.07.2026).
@@ -1898,10 +1902,19 @@ _PT_METAL_DEFAULT = {
 _PT_GIPAR_M = {"ottyazhki": 15.0, "statsionar": 30.0}
 _PT_GIPAR_M_DEFAULT = 23.0
 
-# Цирк: связь числа мест и площади купола, Q = k × S (документ Сергея). Диаметр из мест — обратная
-# формула D = sqrt(4Q / (k·π)). Места НЕ зависят от высоты купола и наклона трибун.
+# Цирк: связь числа мест и площади купола, Q = k × S (документ Сергея 20.07). Формула — запасной
+# путь. ОСНОВА — таблица ниже: это согласованные с Сергеем реальные значения, и на краях они
+# расходятся с формулой (Ø24: таблица 550-600, формула 520-611). Терять живые данные нельзя.
 _PT_CIRCUS_K = 1.25
 _PT_CIRCUS_D_MIN, _PT_CIRCUS_D_MAX = 24.0, 48.0
+
+# Диаметр купола → диапазон числа мест (данные ПРАЙМ-ТЕНТ). Места зависят от диаметра и компоновки
+# проходов; НЕ зависят от высоты купола и наклона трибун.
+_CIRCUS_SEATS = [
+    (24, 550, 600), (25, 600, 650), (28, 700, 800), (30, 800, 950),
+    (32, 1000, 1100), (34, 1100, 1150), (36, 1150, 1250), (38, 1300, 1500),
+    (42, 1800, 1900), (44, 2000, 2100), (46, 2100, 2200), (48, 2500, 2500),
+]
 
 
 def _circus_area(d):
@@ -1909,13 +1922,31 @@ def _circus_area(d):
 
 
 def _circus_seats_for_diameter(d):
-    """Ориентир вместимости по диаметру купола. Отдаём вилку ±8% — компоновка проходов и
-    ширина манежа гуляют, точное число даёт менеджер."""
-    q = _PT_CIRCUS_K * _circus_area(d)
-    return int(round(q * 0.92)), int(round(q * 1.08))
+    """Ориентир вместимости по диаметру купола.
+
+    Внутри таблицы идём по её значениям (в узлах — точно, между узлами — линейно): это
+    согласованные с клиентом данные. Формула Q = k·S — только за пределами таблицы.
+    """
+    tbl = _CIRCUS_SEATS
+    if d < tbl[0][0] or d > tbl[-1][0]:
+        q = _PT_CIRCUS_K * _circus_area(d)
+        return int(round(q * 0.92)), int(round(q * 1.08))
+    for i in range(len(tbl) - 1):
+        d0, l0, h0 = tbl[i]
+        d1, l1, h1 = tbl[i + 1]
+        if d0 <= d <= d1:
+            if d1 == d0:
+                return l0, h0
+            t = (d - d0) / (d1 - d0)
+            return int(round(l0 + t * (l1 - l0))), int(round(h0 + t * (h1 - h0)))
+    return tbl[-1][1], tbl[-1][2]
 
 
 def _circus_diameter_for_seats(n):
+    """Наименьший табличный купол, вмещающий n мест. Вне таблицы — обратная формула."""
+    for d, _l, h in _CIRCUS_SEATS:
+        if h >= n:
+            return float(d)
     d = math.sqrt(4.0 * n / (_PT_CIRCUS_K * math.pi))
     return min(max(d, _PT_CIRCUS_D_MIN), _PT_CIRCUS_D_MAX)
 
@@ -2002,7 +2033,7 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         wall_h = wall_height if with_walls else None
         make = _pt_frame_cost(a, pm if with_walls else 0.0, wall_h, metal_rate, 17.0, 1600.0, t_coef)
         name = "шатра/павильона" if c == "shater_restaurant" else "арочной мембранной конструкции"
-        return {"ok": True, "text": f"Ориентир {name}: порядка {_rub(make)} рублей за изготовление. {_PT_SEP_SHATER}{metal_note}"}
+        return {"ok": True, "text": f"Ориентир {name}: порядка {_rub(make)} рублей. {_PT_NO_MONTAGE} {_PT_SEP_SHATER}{metal_note}"}
 
     if c == "vozduhoopornoe":
         a = _area()
@@ -2021,7 +2052,7 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
             m_coef = _PT_GIPAR_M_DEFAULT
             mount_note = " Посчитано по среднему варианту опор — уточни, оттяжки или стационарные стойки на фундаменте, цифра изменится."
         make = _pt_frame_cost(s, 0.0, None, metal_rate, m_coef, 1900.0, 1.4)
-        return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub(make)} рублей за изготовление. Стен у гипаров не бывает. {_PT_SEP_GIPAR}{metal_note}{mount_note}"}
+        return {"ok": True, "text": f"Ориентир теневого паруса-гипара: порядка {_rub(make)} рублей. {_PT_NO_MONTAGE} Стен у гипаров не бывает. {_PT_SEP_GIPAR}{metal_note}{mount_note}"}
 
     if c == "circus":
         max_seats = _circus_seats_for_diameter(_PT_CIRCUS_D_MAX)[1]
@@ -2051,7 +2082,7 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
             seats_str = f"{sl}" if sl == sh else f"{sl}–{sh}"
             seats_price_lo, seats_price_hi = sl * 6500, sh * 6500
             total = (total + seats_price_lo, total + seats_price_hi)
-            parts.append(f"зрительный зал с пластиковыми креслами примерно на {seats_str} мест — порядка {_rub_range(seats_price_lo, seats_price_hi)} рублей")
+            parts.append(f"зрительный зал с пластиковыми креслами, ориентировочная вместимость {seats_str} мест — порядка {_rub_range(seats_price_lo, seats_price_hi)} рублей")
         if not parts:
             return {"ok": False, "need": "диаметр купола или желаемая вместимость зала"}
         total_text = _rub(total) if isinstance(total, (int, float)) else _rub_range(total[0], total[1])
