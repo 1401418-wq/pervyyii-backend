@@ -2487,9 +2487,12 @@ async def chat(request: Request):
     # Prime-Tent: даём модели инструмент серверного расчёта цены (арифметику не доверяем LLM)
     tools = [_PT_PRICE_TOOL] if client_name == "prime-tent" else None
     # Prime-Tent — флагманский сценарий цирков; Haiku не тянет многошаговый сбор параметров.
+    # pervyyii — витрина студии: помощник на своём сайте и есть демонстрация товара, держать его
+    # слабее клиентского нельзя. Трафик мал, разница в счёте копеечная.
     # Sonnet 5 с ВЫКЛЮЧЕННЫМ thinking: без него Sonnet включает adaptive-мышление по умолчанию,
     # съедает max_tokens=2000 и тормозит чат. disabled сохраняет скорость, даёт прирост ума.
-    model_id = "claude-sonnet-5" if client_name == "prime-tent" else "claude-haiku-4-5-20251001"
+    _SONNET_CLIENTS = {"prime-tent", "pervyyii"}
+    model_id = "claude-sonnet-5" if client_name in _SONNET_CLIENTS else "claude-haiku-4-5-20251001"
     conv = list(masked_messages)
     system_prompt = client_cfg["system"]
     if interest:
