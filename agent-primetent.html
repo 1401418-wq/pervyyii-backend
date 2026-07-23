@@ -144,6 +144,10 @@
           session_id:sessionId, page:referrer})}).catch(function(){});
     } catch (_) {}
   }
+  // Сигнал родительской странице для цели Яндекс.Метрики (ym живёт там, не в iframe)
+  function notifyParentGoal(goal) {
+    try { if (window.parent !== window) window.parent.postMessage({__ptGoal:goal}, "*"); } catch (_) {}
+  }
 
   function setEnabled(on) {
     inputEl.disabled = !on;
@@ -184,6 +188,7 @@
 
     addMessage(text, "user");
     trackEvent("message_sent");
+    notifyParentGoal("pt_assistant_message");
     history.push({ role: "user", content: text });
     inputEl.value = "";
     inputEl.style.height = "auto";

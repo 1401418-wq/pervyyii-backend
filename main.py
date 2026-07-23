@@ -3280,7 +3280,7 @@ async def embed_primetent_js():
 # браузер отвергнет. CORS обязателен для SRI на кросс-доменном скрипте.
 # Обновление = новый файл embed-primetent.vN.js + запись в _EMBED_VERSIONS + новый
 # integrity на страницах клиента (старые версии остаются валидными).
-_EMBED_VERSIONS = {"v1", "v2", "v3"}
+_EMBED_VERSIONS = {"v1", "v2", "v3", "v4"}
 
 
 @app.get("/embed-primetent.{version}.js")
