@@ -145,6 +145,7 @@
     } catch (_) {}
   }
   // Сигнал родительской странице для цели Яндекс.Метрики (ym живёт там, не в iframe)
+  var leadGoalSent = false;
   function notifyParentGoal(goal) {
     try { if (window.parent !== window) window.parent.postMessage({__ptGoal:goal}, "*"); } catch (_) {}
   }
@@ -209,6 +210,10 @@
       });
       const data = await res.json();
       hideTyping();
+      if (data.lead && !leadGoalSent) {
+        leadGoalSent = true;
+        notifyParentGoal("pt_assistant_lead");
+      }
       if (data.reply) {
         addMessage(data.reply, "bot");
         history.push({ role: "assistant", content: data.reply });

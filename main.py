@@ -56,6 +56,10 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")  # для авторег
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # legacy, больше не используется для голоса
 YC_API_KEY = os.environ.get("YC_API_KEY_SECRET", "")   # Яндекс SpeechKit (РФ) — распознавание голосовых
 YC_FOLDER = os.environ.get("YC_FOLDER_ID", "")
+# Цель Метрики о заявке (prime-tent). Держать выключенным, пока страницы клиента не
+# переведены на загрузчик v6: v5 такую цель не пропускает, а флаг lead_goal_sent уже
+# сгорит — сессия молча потеряет конверсию. Включать ПОСЛЕ замены SRI на всех страницах.
+PT_LEAD_GOAL_ENABLED = os.environ.get("PT_LEAD_GOAL_ENABLED", "") == "1"
 
 # ─────────────────── Лимиты и защита от абуза ───────────────────
 import time as _time
@@ -2723,6 +2727,7 @@ async def chat(request: Request):
     usage = data.get("usage") or {}
 
     # Log assistant reply + update counters + kick off background extraction
+    lead_signal = False
     if pool:
         try:
             async with pool.acquire() as conn:
@@ -2739,11 +2744,33 @@ async def chat(request: Request):
                        WHERE session_id=$1""",
                     session_id,
                 )
+                # Цель Метрики о заявке нужно позвать синхронно (extract_metadata уходит
+                # в фон и к моменту ответа ещё не знает о контакте), поэтому опираемся на
+                # локальную регулярку. Флаг ставим атомарно: has_lead=FALSE отсекает
+                # уже разобранные фоном сессии, lead_goal_sent=FALSE — повтор при второй
+                # вкладке, перезагрузке iframe или ретрае запроса.
+                if (
+                    PT_LEAD_GOAL_ENABLED
+                    and client_cfg.get("kind") == "prime-tent"
+                    and _extract_contact_local(user_text)["has_lead"]
+                ):
+                    lead_signal = bool(
+                        await conn.fetchval(
+                            """UPDATE sessions SET lead_goal_sent = TRUE
+                               WHERE session_id=$1 AND has_lead = FALSE
+                                 AND lead_goal_sent = FALSE
+                               RETURNING session_id""",
+                            session_id,
+                        )
+                    )
             asyncio.create_task(extract_metadata(session_id, client_name))
         except Exception as e:
             print(f"[chat] db log assistant msg failed: {e}")
 
-    return JSONResponse({"reply": reply, "usage": usage, "session_id": session_id})
+    payload = {"reply": reply, "usage": usage, "session_id": session_id}
+    if lead_signal:
+        payload["lead"] = True
+    return JSONResponse(payload)
 
 
 # ─────────────────── Admin ───────────────────
@@ -3378,7 +3405,7 @@ async def embed_primetent_js():
 # браузер отвергнет. CORS обязателен для SRI на кросс-доменном скрипте.
 # Обновление = новый файл embed-primetent.vN.js + запись в _EMBED_VERSIONS + новый
 # integrity на страницах клиента (старые версии остаются валидными).
-_EMBED_VERSIONS = {"v1", "v2", "v3", "v4", "v5"}
+_EMBED_VERSIONS = {"v1", "v2", "v3", "v4", "v5", "v6"}
 
 
 @app.get("/embed-primetent.{version}.js")

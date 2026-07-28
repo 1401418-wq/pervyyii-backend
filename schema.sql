@@ -24,6 +24,9 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS email_last_error TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_status TEXT NOT NULL DEFAULT 'new';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_status_updated_at TIMESTAMPTZ;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_reminder_sent_at TIMESTAMPTZ;
+-- Цель Метрики о заявке шлётся ровно один раз на сессию: ставится атомарно в /chat,
+-- иначе перезагрузка iframe, вторая вкладка или ретрай запроса накрутят конверсию.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS lead_goal_sent BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_lead_status_check;
 ALTER TABLE sessions ADD CONSTRAINT sessions_lead_status_check
   CHECK (lead_status IN ('new','contacted','in_discussion','quote','won','lost'));
