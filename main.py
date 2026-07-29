@@ -2295,18 +2295,25 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
                 files={"file": ("conversions.csv", csv.encode("utf-8"), "text/csv")},
             )
         # HTTP 200 значит лишь «запрос принят к обработке»: успехом считаем только
-        # подтверждённую загрузку в теле ответа.
-        ok = False
+        # подтверждённую загрузку в теле ответа. Отдельно ловим случай, когда файл
+        # обработан, но визит не найден: повторять бессмысленно (задним числом визит
+        # не появится), это проблема атрибуции, а не доставки.
+        state = "failed"
         if r.status_code == 200:
             try:
                 up = (r.json() or {}).get("uploading") or {}
-                ok = str(up.get("status", "")).upper() in ("UPLOADED", "PROCESSED", "LINKAGE_FAILURE_PROCESSED")
-                if not ok:
+                status = str(up.get("status", "")).upper()
+                if status in ("UPLOADED", "PROCESSED"):
+                    state = "sent"
+                elif status == "LINKAGE_FAILURE_PROCESSED":
+                    state = "unlinked"
+                    print(f"[offline-conv] {session_id}: загружено, но визит не найден")
+                else:
                     print(f"[offline-conv] {session_id}: Метрика не подтвердила загрузку: {up}")
             except Exception:
                 print(f"[offline-conv] {session_id}: тело ответа не разобрано: {r.text[:200]}")
-        print(f"[offline-conv] {session_id}: {id_type} -> HTTP {r.status_code}, принято={ok}")
-        await _finish_offline_claim(session_id, claim_id, "sent" if ok else "failed")
+        print(f"[offline-conv] {session_id}: {id_type} -> HTTP {r.status_code}, состояние={state}")
+        await _finish_offline_claim(session_id, claim_id, state)
     except Exception as e:
         print(f"[offline-conv] {session_id}: не отправлено: {e}")
         await _finish_offline_claim(session_id, claim_id, "failed")

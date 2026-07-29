@@ -118,6 +118,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sessions_offline_conv_state_chk') THEN
         ALTER TABLE sessions ADD CONSTRAINT sessions_offline_conv_state_chk
-            CHECK (offline_conv_state IN ('pending', 'sending', 'sent', 'failed', 'unattributed'));
+            CHECK (offline_conv_state IN ('pending', 'sending', 'sent', 'failed',
+                                          'unattributed', 'unlinked'));
     END IF;
 END $$;
