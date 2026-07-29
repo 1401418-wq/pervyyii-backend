@@ -61,6 +61,14 @@ YC_FOLDER = os.environ.get("YC_FOLDER_ID", "")
 # сгорит — сессия молча потеряет конверсию. Включать ПОСЛЕ замены SRI на всех страницах.
 PT_LEAD_GOAL_ENABLED = os.environ.get("PT_LEAD_GOAL_ENABLED", "") == "1"
 
+# Офлайн-конверсии в Метрику: сервер сам сообщает о подтверждённой заявке, не полагаясь
+# на браузер. 28.07 заявка по цирку-шапито (сумма семизначная) не попала ни в одну цель —
+# у человека не отработал счётчик, и для Директа этой заявки не существовало.
+METRIKA_OAUTH_TOKEN = os.environ.get("METRIKA_OAUTH_TOKEN", "")
+PT_OFFLINE_CONV_ENABLED = os.environ.get("PT_OFFLINE_CONV_ENABLED", "") == "1"
+PT_METRIKA_COUNTER = os.environ.get("PT_METRIKA_COUNTER", "110782967")
+PT_OFFLINE_CONV_TARGET = os.environ.get("PT_OFFLINE_CONV_TARGET", "pt_assistant_lead")
+
 # ─────────────────── Лимиты и защита от абуза ───────────────────
 import time as _time
 
@@ -2223,6 +2231,89 @@ _PT_PRICE_TOOL = {
 }
 
 
+async def send_offline_conversion(session_id: str, client_name: str) -> None:
+    """Сообщает Метрике о подтверждённой заявке, минуя браузер.
+
+    Ключ привязки — yclid из адреса рекламного перехода: он приходит в URL и не зависит
+    от того, отработал ли счётчик у пользователя. ClientID берём запасным вариантом.
+    Если ни того ни другого нет (человек пришёл не с рекламы) — отправлять нечего.
+    """
+    if not (PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN and pool):
+        return
+    if _get_client(client_name)["kind"] != "prime-tent":
+        return
+    try:
+        # Атомарный захват: строку забирает ровно один воркер. Проверять
+        # «ещё не отправлено» отдельным SELECT нельзя — два параллельных разбора
+        # одной сессии успевали увидеть NULL оба и слали конверсию дважды.
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE sessions
+                      SET offline_conv_state = 'sending', offline_conv_attempt_at = NOW()
+                    WHERE session_id = $1 AND has_lead = TRUE
+                      AND (offline_conv_state IN ('pending', 'failed')
+                           OR (offline_conv_state = 'sending'
+                               AND offline_conv_attempt_at < NOW() - INTERVAL '15 minutes'))
+                RETURNING yclid, ym_client_id""",
+                session_id,
+            )
+        if not row:
+            return
+        if row["yclid"]:
+            id_type, column, ident = "YCLID", "Yclid", row["yclid"]
+        elif row["ym_client_id"]:
+            id_type, column, ident = "CLIENT_ID", "ClientId", row["ym_client_id"]
+        else:
+            # Заявка не с рекламы либо идентификаторы не долетели. Привязывать не к чему,
+            # но считаем такие случаи: это и есть доля заявок, невидимых для Метрики.
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE sessions SET offline_conv_state='unattributed' WHERE session_id=$1",
+                    session_id,
+                )
+                await conn.execute(
+                    """INSERT INTO widget_events(client, session_id, event_name, page)
+                       VALUES ($1, $2, 'offline_conv_unattributed', '')""",
+                    client_name, session_id,
+                )
+            print(f"[offline-conv] {session_id}: без yclid и ClientID, привязать не к чему")
+            return
+
+        # Время берём по моменту подтверждения заявки, а не по началу сессии: человек
+        # мог написать через сутки после визита, и старая метка исказила бы привязку.
+        ts = int(_time.time())
+        csv = f"{column},Target,DateTime\n{ident},{PT_OFFLINE_CONV_TARGET},{ts}\n"
+        url = (f"https://api-metrika.yandex.net/management/v1/counter/"
+               f"{PT_METRIKA_COUNTER}/offline_conversions/upload?client_id_type={id_type}")
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                url,
+                headers={"Authorization": f"OAuth {METRIKA_OAUTH_TOKEN}"},
+                files={"file": ("conversions.csv", csv.encode("utf-8"), "text/csv")},
+            )
+        ok = r.status_code == 200
+        print(f"[offline-conv] {session_id}: {id_type} -> {r.status_code} {r.text[:200]}")
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE sessions
+                      SET offline_conv_state = $2,
+                          offline_conv_sent_at = CASE WHEN $2 = 'sent' THEN NOW()
+                                                      ELSE offline_conv_sent_at END
+                    WHERE session_id = $1""",
+                session_id, "sent" if ok else "failed",
+            )
+    except Exception as e:
+        print(f"[offline-conv] {session_id}: не отправлено: {e}")
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE sessions SET offline_conv_state='failed' WHERE session_id=$1",
+                    session_id,
+                )
+        except Exception:
+            pass
+
+
 async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> None:
     """Background: read transcript, ask LLM for structured fields, update sessions row.
     Fires a lead notification on first lead detection, routed per client."""
@@ -2291,6 +2382,12 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                 local["contact"],
                 bool(cfg["kind"] == "prime-tent" and has_lead_new and not (sess and sess["lead_notified"])),
             )
+        # Заявка подтверждена разбором — сообщаем Метрике офлайн-конверсией.
+        # Именно здесь, а не по локальной регулярке в /chat: в Директ должен уходить
+        # проверенный лид, а не предварительный сигнал.
+        if has_lead_new and not (sess and sess["lead_notified"]):
+            asyncio.create_task(send_offline_conversion(session_id, client_name))
+
         # Fire lead notification on transition false → true, routed per client
         if has_lead_new and not (sess and sess["lead_notified"]):
             if cfg["kind"] == "prime-tent":
@@ -2581,6 +2678,10 @@ async def chat(request: Request):
 
     session_id = body.get("session_id") or str(uuid.uuid4())
     referrer = _sanitize_referrer(body.get("referrer") or "")
+    # Идентификаторы рекламного клика: yclid не зависит от Метрики в браузере,
+    # поэтому именно он вытягивает заявки от людей с блокировщиками.
+    yclid = re.sub(r"[^0-9A-Za-z_-]", "", str(body.get("yclid") or ""))[:64]
+    ym_client_id = re.sub(r"[^0-9]", "", str(body.get("ym_client_id") or ""))[:32]
     interest = str(body.get("interest") or "").strip().lower()[:40]
     if client_name != "prime-tent" or interest not in _PRIME_CIRCUS_INTERESTS:
         interest = ""
@@ -2599,11 +2700,15 @@ async def chat(request: Request):
         try:
             async with pool.acquire() as conn:
                 await conn.execute(
-                    """INSERT INTO sessions (session_id, user_agent, referrer, ip, interest)
-                       VALUES ($1, $2, $3, $4, $5)
+                    """INSERT INTO sessions (session_id, user_agent, referrer, ip, interest,
+                                             yclid, ym_client_id)
+                       VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''))
                        ON CONFLICT (session_id) DO UPDATE SET last_activity_at=NOW(),
-                         interest=COALESCE(NULLIF(EXCLUDED.interest,''), sessions.interest)""",
+                         interest=COALESCE(NULLIF(EXCLUDED.interest,''), sessions.interest),
+                         yclid=COALESCE(sessions.yclid, EXCLUDED.yclid),
+                         ym_client_id=COALESCE(sessions.ym_client_id, EXCLUDED.ym_client_id)""",
                     session_id, user_agent, referrer[:500], ip[:64], interest,
+                    yclid, ym_client_id,
                 )
                 rows = await conn.fetch(
                     """SELECT role, content FROM messages

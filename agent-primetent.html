@@ -150,6 +150,32 @@
     try { if (window.parent !== window) window.parent.postMessage({__ptGoal:goal}, "*"); } catch (_) {}
   }
 
+  // Идентификаторы рекламного клика приходят от загрузчика (v7): в iframe своего
+  // адреса страницы нет, а yclid нужен, чтобы сервер сам сообщил Метрике о заявке —
+  // браузерная цель теряется, если у человека не отработал счётчик.
+  // Принимаем только от родительского окна и только с известных адресов клиента:
+  // иначе посторонний скрипт на странице пришлёт свой yclid и припишет нашу заявку
+  // чужому клику. Referrer для этого не годится — его режет Referrer-Policy.
+  var ALLOWED_PARENTS = ["https://prime-tent.ru", "https://www.prime-tent.ru"];
+  var ptYclid = "", ptClientId = "";
+  window.addEventListener("message", function (e) {
+    if (e.source !== window.parent) return;
+    if (ALLOWED_PARENTS.indexOf(e.origin) === -1) return;
+    var a = e.data && e.data.__ptAttr;
+    if (!a) return;
+    if (a.yclid) ptYclid = String(a.yclid).slice(0, 64);
+    if (a.clientId) ptClientId = String(a.clientId).slice(0, 64);
+    // подтверждаем приём: без этого загрузчик не знает, дошла ли атрибуция
+    try { window.parent.postMessage({__ptAttrAck: true}, e.origin); } catch (_) {}
+  });
+  try {
+    if (window.parent !== window) {
+      ALLOWED_PARENTS.forEach(function (o) {
+        try { window.parent.postMessage({__ptReady: true}, o); } catch (_) {}
+      });
+    }
+  } catch (_) {}
+
   function setEnabled(on) {
     inputEl.disabled = !on;
     sendBtn.disabled = !on;
@@ -205,7 +231,9 @@
           session_id: sessionId,
           client: "prime-tent",
           referrer: referrer,
-          interest: interest
+          interest: interest,
+          yclid: ptYclid,
+          ym_client_id: ptClientId
         })
       });
       const data = await res.json();

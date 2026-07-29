@@ -96,3 +96,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_requests_time ON audit_requests(created_at 
 CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_lead ON sessions(has_lead) WHERE has_lead = TRUE;
 CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts_subscribers(source);
+
+-- 29.07.2026: атрибуция заявок для Директа.
+-- yclid — идентификатор клика Яндекса из URL рекламного перехода; работает даже когда
+-- у пользователя не отработала Метрика (блокировщик, приватный режим) — именно так
+-- 28.07 потерялась заявка по цирку-шапито. ym_client_id — запасной ключ привязки.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS yclid TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ym_client_id TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_sent_at TIMESTAMPTZ;
+-- Состояние отправки, а не просто «отправлено»: два параллельных разбора одной сессии
+-- одновременно видели offline_conv_sent_at IS NULL и слали конверсию дважды.
+-- pending -> sending -> sent, при ошибке failed; зависший sending переигрываем через 15 минут.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_state TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_attempt_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_sessions_offline_pending
+    ON sessions(created_at) WHERE has_lead = TRUE AND offline_conv_state <> 'sent';
