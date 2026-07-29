@@ -2242,6 +2242,8 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
         return
     if _get_client(client_name)["kind"] != "prime-tent":
         return
+    # метка попытки нужна и в ветке ошибки, поэтому заводим до try
+    claim_id = str(uuid.uuid4())
     try:
         # Атомарный захват: строку забирает ровно один воркер. Проверять
         # «ещё не отправлено» отдельным SELECT нельзя — два параллельных разбора
@@ -2249,13 +2251,14 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """UPDATE sessions
-                      SET offline_conv_state = 'sending', offline_conv_attempt_at = NOW()
+                      SET offline_conv_state = 'sending', offline_conv_attempt_at = NOW(),
+                          offline_conv_claim_id = $2
                     WHERE session_id = $1 AND has_lead = TRUE
                       AND (offline_conv_state IN ('pending', 'failed')
                            OR (offline_conv_state = 'sending'
                                AND offline_conv_attempt_at < NOW() - INTERVAL '15 minutes'))
                 RETURNING yclid, ym_client_id""",
-                session_id,
+                session_id, claim_id,
             )
         if not row:
             return
@@ -2291,27 +2294,40 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
                 headers={"Authorization": f"OAuth {METRIKA_OAUTH_TOKEN}"},
                 files={"file": ("conversions.csv", csv.encode("utf-8"), "text/csv")},
             )
-        ok = r.status_code == 200
-        print(f"[offline-conv] {session_id}: {id_type} -> {r.status_code} {r.text[:200]}")
+        # HTTP 200 значит лишь «запрос принят к обработке»: успехом считаем только
+        # подтверждённую загрузку в теле ответа.
+        ok = False
+        if r.status_code == 200:
+            try:
+                up = (r.json() or {}).get("uploading") or {}
+                ok = str(up.get("status", "")).upper() in ("UPLOADED", "PROCESSED", "LINKAGE_FAILURE_PROCESSED")
+                if not ok:
+                    print(f"[offline-conv] {session_id}: Метрика не подтвердила загрузку: {up}")
+            except Exception:
+                print(f"[offline-conv] {session_id}: тело ответа не разобрано: {r.text[:200]}")
+        print(f"[offline-conv] {session_id}: {id_type} -> HTTP {r.status_code}, принято={ok}")
+        await _finish_offline_claim(session_id, claim_id, "sent" if ok else "failed")
+    except Exception as e:
+        print(f"[offline-conv] {session_id}: не отправлено: {e}")
+        await _finish_offline_claim(session_id, claim_id, "failed")
+
+
+async def _finish_offline_claim(session_id: str, claim_id: str, state: str) -> None:
+    """Закрывает ИМЕННО свою попытку: чужой claim (перехваченный по таймауту) не трогаем."""
+    try:
         async with pool.acquire() as conn:
             await conn.execute(
                 """UPDATE sessions
-                      SET offline_conv_state = $2,
-                          offline_conv_sent_at = CASE WHEN $2 = 'sent' THEN NOW()
+                      SET offline_conv_state = $3,
+                          offline_conv_sent_at = CASE WHEN $3 = 'sent' THEN NOW()
                                                       ELSE offline_conv_sent_at END
-                    WHERE session_id = $1""",
-                session_id, "sent" if ok else "failed",
+                    WHERE session_id = $1
+                      AND offline_conv_state = 'sending'
+                      AND offline_conv_claim_id = $2""",
+                session_id, claim_id, state,
             )
     except Exception as e:
-        print(f"[offline-conv] {session_id}: не отправлено: {e}")
-        try:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE sessions SET offline_conv_state='failed' WHERE session_id=$1",
-                    session_id,
-                )
-        except Exception:
-            pass
+        print(f"[offline-conv] {session_id}: не удалось закрыть попытку: {e}")
 
 
 async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> None:

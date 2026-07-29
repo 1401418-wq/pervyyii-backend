@@ -109,5 +109,15 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_sent_at TIMESTAMPTZ;
 -- pending -> sending -> sent, при ошибке failed; зависший sending переигрываем через 15 минут.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_state TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_attempt_at TIMESTAMPTZ;
+-- Метка конкретной попытки: без неё запрос, чей claim уже протух и перехвачен другим,
+-- на выходе затирал чужой успешный результат своей ошибкой.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_claim_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_sessions_offline_pending
     ON sessions(created_at) WHERE has_lead = TRUE AND offline_conv_state <> 'sent';
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sessions_offline_conv_state_chk') THEN
+        ALTER TABLE sessions ADD CONSTRAINT sessions_offline_conv_state_chk
+            CHECK (offline_conv_state IN ('pending', 'sending', 'sent', 'failed', 'unattributed'));
+    END IF;
+END $$;
