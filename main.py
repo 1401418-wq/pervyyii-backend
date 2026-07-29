@@ -3516,6 +3516,48 @@ async def health():
     return {"status": "ok", "db": "up" if pool else "down"}
 
 
+# Отдельно от /chat: тот пишет каждое обращение в sessions и messages, и сторож раз
+# в 15 минут засорил бы статистику фальшивыми диалогами. Здесь только факт, что ключ
+# жив и кредиты не кончились: 29.07 API отключили за нулевой баланс, и агенты молчали
+# полчаса, пока это не нашли руками.
+@app.get("/health/llm")
+async def health_llm(request: Request):
+    # Наружу не отдаём: nginx проксирует весь /api/hub/, и без этой проверки любой мог бы
+    # дёргать эндпоинт и жечь наши токены. Сторож живёт на этой же машине и ходит напрямую
+    # в порт, поэтому проксировавшихся заголовков у него нет — по ним и отличаем.
+    if request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    host = request.client.host if request.client else ""
+    if not (host.startswith("127.") or host.startswith("172.") or host == "::1"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not ANTHROPIC_API_KEY:
+        return JSONResponse({"status": "fail", "reason": "no api key"}, status_code=503)
+    started = _time.monotonic()
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 5,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+    ms = int((_time.monotonic() - started) * 1000)
+    data = response.json()
+    if response.status_code != 200 or "error" in data:
+        reason = data.get("error", {}).get("message", "")[:200] if isinstance(data, dict) else ""
+        return JSONResponse(
+            {"status": "fail", "http": response.status_code, "reason": reason, "ms": ms},
+            status_code=503,
+        )
+    return {"status": "ok", "ms": ms}
+
+
 @app.get("/agent.html")
 async def agent_page():
     return FileResponse("agent.html")
