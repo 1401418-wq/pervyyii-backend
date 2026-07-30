@@ -927,7 +927,9 @@ pool: asyncpg.Pool | None = None
 _email_retry_task: asyncio.Task | None = None
 _lead_reminder_task: asyncio.Task | None = None
 _lead_notify_task: asyncio.Task | None = None
+_site_lead_retention_task: asyncio.Task | None = None
 LEAD_REMINDERS_ENABLED = os.environ.get("LEAD_REMINDERS_ENABLED", "0") == "1"
+SITE_LEAD_RETENTION_DAYS = int(os.environ.get("SITE_LEAD_RETENTION_DAYS", "1095"))
 
 
 # ─────────────── Telegram polling (РФ: webhook от TG режется РКН, опрашиваем сами через трубу) ───────────────
@@ -986,7 +988,7 @@ async def _start_polling() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global pool, _email_retry_task, _lead_reminder_task, _lead_notify_task
+    global pool, _email_retry_task, _lead_reminder_task, _lead_notify_task, _site_lead_retention_task
     if not DATABASE_URL:
         print("[startup] DATABASE_URL not set — analytics disabled")
         return
@@ -997,6 +999,7 @@ async def startup() -> None:
         print("[startup] DB pool ready")
         _email_retry_task = asyncio.create_task(_prime_email_retry_loop())
         _lead_notify_task = asyncio.create_task(_lead_notify_retry_loop())
+        _site_lead_retention_task = asyncio.create_task(_site_lead_retention_loop())
         if LEAD_REMINDERS_ENABLED:
             _lead_reminder_task = asyncio.create_task(_prime_lead_reminder_loop())
         if TELEGRAM_POLLING:
@@ -1011,8 +1014,8 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global _email_retry_task, _lead_reminder_task, _lead_notify_task
-    for task_name in ("_email_retry_task", "_lead_reminder_task", "_lead_notify_task"):
+    global _email_retry_task, _lead_reminder_task, _lead_notify_task, _site_lead_retention_task
+    for task_name in ("_email_retry_task", "_lead_reminder_task", "_lead_notify_task", "_site_lead_retention_task"):
         task = globals().get(task_name)
         if task:
             task.cancel()
@@ -3611,6 +3614,31 @@ async def _lead_notify_retry_loop() -> None:
         except Exception as e:
             print(f"[lead] retry loop failed: {type(e).__name__}: {_safe_err(e)}")
         await asyncio.sleep(60)
+
+
+async def _site_lead_retention_loop() -> None:
+    """Удаляет заявки с истёкшим сроком хранения.
+
+    Срок совпадает с публичной политикой: три года после создания заявки.
+    Удаляем строку целиком, а не только IP: имя и контакт также являются ПД.
+    Периодический запуск не зависит от внешнего cron и переживает обычный рестарт.
+    """
+    while True:
+        try:
+            if pool:
+                async with pool.acquire() as conn:
+                    result = await conn.execute(
+                        "DELETE FROM site_leads "
+                        "WHERE created_at < NOW() - ($1::text || ' days')::interval",
+                        str(SITE_LEAD_RETENTION_DAYS),
+                    )
+                if result != "DELETE 0":
+                    print(f"[lead] retention: {result}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[lead] retention failed: {type(e).__name__}: {_safe_err(e)}")
+        await asyncio.sleep(86400)
 
 
 # Тело заявки — это несколько текстовых полей. Всё, что больше, читать в память незачем:
