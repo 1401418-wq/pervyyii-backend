@@ -926,6 +926,7 @@ DEMO_SYSTEM = """Ты — Telegram-бот @pervyyii_demo_bot. Живая дем�
 pool: asyncpg.Pool | None = None
 _email_retry_task: asyncio.Task | None = None
 _lead_reminder_task: asyncio.Task | None = None
+_lead_notify_task: asyncio.Task | None = None
 LEAD_REMINDERS_ENABLED = os.environ.get("LEAD_REMINDERS_ENABLED", "0") == "1"
 
 
@@ -985,7 +986,7 @@ async def _start_polling() -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global pool, _email_retry_task, _lead_reminder_task
+    global pool, _email_retry_task, _lead_reminder_task, _lead_notify_task
     if not DATABASE_URL:
         print("[startup] DATABASE_URL not set — analytics disabled")
         return
@@ -995,6 +996,7 @@ async def startup() -> None:
             await conn.execute("SELECT 1")  # проверка коннекта; схему применяет деплой под agents
         print("[startup] DB pool ready")
         _email_retry_task = asyncio.create_task(_prime_email_retry_loop())
+        _lead_notify_task = asyncio.create_task(_lead_notify_retry_loop())
         if LEAD_REMINDERS_ENABLED:
             _lead_reminder_task = asyncio.create_task(_prime_lead_reminder_loop())
         if TELEGRAM_POLLING:
@@ -1009,8 +1011,8 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global _email_retry_task, _lead_reminder_task
-    for task_name in ("_email_retry_task", "_lead_reminder_task"):
+    global _email_retry_task, _lead_reminder_task, _lead_notify_task
+    for task_name in ("_email_retry_task", "_lead_reminder_task", "_lead_notify_task"):
         task = globals().get(task_name)
         if task:
             task.cancel()
@@ -3504,6 +3506,214 @@ async def audit(request: Request):
         "usage": (last_data or {}).get("usage", {}),
         "debug": {"site_ok": site_ok, "html_text_len": len(parsed["body_text"]), "jina": jina_status},
     })
+
+
+async def _lead_notify(text: str) -> bool:
+    """Уведомление о заявке с посадочной.
+
+    В отличие от tg_send, возвращает результат: заявку нельзя потерять молча.
+    Если ни одно сообщение не ушло, фронт должен об этом узнать и предложить
+    человеку написать в Telegram руками.
+    """
+    if not (TELEGRAM_BOT_TOKEN and pool):
+        return False
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT chat_id FROM telegram_subscribers")
+    except Exception as e:
+        print(f"[lead] subscribers fetch failed: {_safe_err(e)}")
+        return False
+    sent = False
+    async with httpx.AsyncClient(timeout=15) as client:
+        for r in rows:
+            try:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": r["chat_id"], "text": text, "parse_mode": "HTML"},
+                )
+                if resp.status_code == 400:
+                    resp = await client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        json={"chat_id": r["chat_id"], "text": text},
+                    )
+                if resp.status_code == 200:
+                    sent = True
+            except Exception as e:
+                print(f"[lead] send to {r['chat_id']} failed: {_safe_err(e)}")
+    return sent
+
+
+LEAD_NOTIFY_MAX_ATTEMPTS = 20
+LEAD_CLAIM_STALE = "5 minutes"
+
+
+def _lead_message(row, resent: bool = False) -> str:
+    """Текст уведомления о заявке. Одна функция на оба пути — первичный и дослыл,
+    иначе два варианта сообщения однажды разъедутся."""
+    e = html.escape
+    head = f"🟢 <b>Заявка с сайта</b> {e(row['page'] or '') or '—'}"
+    lines = [head + (" (дослано)" if resent else ""),
+             f"Имя: {e(row['name'])}",
+             f"Контакт: {e(row['contact'])}"]
+    for label, key in (("Задача", "task"), ("Сайт", "site"),
+                       ("О бизнесе", "note"), ("Источник", "source")):
+        if row[key]:
+            lines.append(f"{label}: {e(row[key])}")
+    return "\n".join(lines)
+
+
+async def _lead_notify_retry_loop() -> None:
+    """Дослать уведомления о заявках, которые сохранились, но не дошли в Telegram.
+
+    Без этого заявка молча лежала бы в базе: человек видит «принято», а мы о ней
+    не знаем, пока не заглянем в таблицу.
+
+    Строки ЗАХВАТЫВАЮТСЯ атомарно. Иначе между вставкой заявки и простановкой
+    notified_at есть окно (пока идёт запрос в Telegram), в которое цикл успевает
+    подхватить ту же строку — и владелец получает дубль. Захват же переживает
+    и падение процесса: через LEAD_CLAIM_STALE строка снова доступна.
+    """
+    while True:
+        try:
+            if pool:
+                async with pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        f"""UPDATE site_leads
+                            SET notify_claimed_at = NOW(),
+                                notify_attempts = notify_attempts + 1,
+                                notify_claim_id = gen_random_uuid()
+                            WHERE id IN (
+                              SELECT id FROM site_leads
+                              WHERE notified_at IS NULL
+                                AND notify_attempts < {LEAD_NOTIFY_MAX_ATTEMPTS}
+                                AND (notify_claimed_at IS NULL
+                                     OR notify_claimed_at < NOW() - INTERVAL '{LEAD_CLAIM_STALE}')
+                              ORDER BY created_at
+                              LIMIT 20
+                              FOR UPDATE SKIP LOCKED
+                            )
+                            RETURNING id, notify_claim_id, page, name, contact, task, site, note, source"""
+                    )
+                for row in rows:
+                    if await _lead_notify(_lead_message(row, resent=True)):
+                        async with pool.acquire() as conn:
+                            done = await conn.execute(
+                                "UPDATE site_leads SET notified_at = NOW()"
+                                " WHERE id = $1 AND notify_claim_id = $2 AND notified_at IS NULL",
+                                row["id"], row["notify_claim_id"],
+                            )
+                        if done.endswith(" 0"):
+                            print(f"[lead] заявка {row['id']}: захват перехвачен, метку ставит другой", flush=True)
+                        else:
+                            print(f"[lead] дослано уведомление по заявке {row['id']}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[lead] retry loop failed: {type(e).__name__}: {_safe_err(e)}")
+        await asyncio.sleep(60)
+
+
+# Тело заявки — это несколько текстовых полей. Всё, что больше, читать в память незачем:
+# поля мы обрезаем уже ПОСЛЕ разбора JSON, то есть огромный запрос успел бы её занять.
+LEAD_MAX_BODY = 32 * 1024
+
+
+@app.post("/lead")
+async def lead(request: Request):
+    """Приём заявки прямо с посадочных /sites/ и /direct/.
+
+    Заведено 30.07.2026. До этого форма никуда не отправлялась: она открывала
+    Telegram с готовым текстом, а отправлять человек должен был сам. Этот шаг
+    мы не видели и не измеряли, и на нём терялись все: 0 переходов в Telegram
+    из 19 законченных AI-аудитов.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > LEAD_MAX_BODY:
+        return JSONResponse({"error": "Слишком большой запрос"}, status_code=413)
+
+    raw = b""
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > LEAD_MAX_BODY:
+            # Заголовку не доверяем: без content-length (chunked) его просто нет.
+            return JSONResponse({"error": "Слишком большой запрос"}, status_code=413)
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("not an object")
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    # Ловушка для ботов: поле спрятано стилями, человек его не заполнит.
+    if (body.get("company") or "").strip():
+        return JSONResponse({"ok": True})
+
+    def field(key: str, limit: int) -> str:
+        return (body.get(key) or "").strip()[:limit]
+
+    name = field("name", 100)
+    contact = field("contact", 100)
+    if not name or not contact:
+        return JSONResponse({"error": "Укажите имя и контакт"}, status_code=400)
+
+    ip = _client_ip(request)
+    if ip not in ("127.0.0.1", "::1", "localhost", "unknown") and _rate_limited(f"lead:{ip}", limit=5, window=3600):
+        return JSONResponse({"error": "Слишком много заявок с одного адреса. Напишите нам в Telegram."}, status_code=429)
+    if _rate_limited("lead:_global", limit=100, window=3600):
+        return JSONResponse({"error": "Сервис перегружен, попробуйте позже."}, status_code=429)
+
+    page = field("page", 60)
+    task = field("task", 120)
+    site = field("site", 200)
+    note = field("note", 1000)
+    source = field("source", 200)
+
+    lead_id = None
+    claim_id = None
+    if pool:
+        try:
+            async with pool.acquire() as conn:
+                # Захватываем строку сразу при вставке: отправлять будем прямо сейчас,
+                # и цикл дослыла не должен взять её же, пока идёт запрос в Telegram.
+                row = await conn.fetchrow(
+                    "INSERT INTO site_leads (page, name, contact, task, site, note, source, ip,"
+                    " notify_claimed_at, notify_attempts, notify_claim_id)"
+                    " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), 1, gen_random_uuid())"
+                    " RETURNING id, notify_claim_id",
+                    page, name, contact, task, site, note, source, ip,
+                )
+                lead_id, claim_id = row["id"], row["notify_claim_id"]
+        except Exception as e:
+            print(f"[lead] save failed: {_safe_err(e)}")
+    saved = lead_id is not None
+
+    notified = await _lead_notify(_lead_message({
+        "page": page, "name": name, "contact": contact,
+        "task": task, "site": site, "note": note, "source": source,
+    }))
+
+    if not saved and not notified:
+        # Ни в базу, ни в Telegram — честно говорим фронту, он предложит написать руками.
+        return JSONResponse({"error": "Не удалось принять заявку"}, status_code=502)
+
+    if notified and lead_id is not None and pool:
+        try:
+            async with pool.acquire() as conn:
+                # Завершаем ИМЕННО свою попытку. Если наша отправка провисела дольше,
+                # чем живёт захват, строку успел забрать цикл дослыла — тогда метку
+                # ставит он, а не мы, и дубля в учёте не возникает.
+                done = await conn.execute(
+                    "UPDATE site_leads SET notified_at = NOW()"
+                    " WHERE id = $1 AND notify_claim_id = $2 AND notified_at IS NULL",
+                    lead_id, claim_id,
+                )
+                if done.endswith(" 0"):
+                    print(f"[lead] захват заявки {lead_id} перехвачен циклом — метку ставит он", flush=True)
+        except Exception as e:
+            print(f"[lead] mark notified failed: {_safe_err(e)}")
+
+    print(f"[lead] id={lead_id} page={page} saved={saved} notified={notified}", flush=True)
+    return JSONResponse({"ok": True})
 
 
 @app.get("/")

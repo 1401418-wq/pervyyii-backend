@@ -122,3 +122,38 @@ BEGIN
                                           'unattributed', 'unlinked'));
     END IF;
 END $$;
+
+-- ─────────────── Заявки с посадочных /sites/ и /direct/ (30.07.2026) ───────────────
+-- До этого форма никуда не отправлялась: открывала Telegram с готовым текстом, а слать
+-- человек должен был сам. Ноль переходов из 19 законченных аудитов — на этом шаге терялись все.
+CREATE TABLE IF NOT EXISTS site_leads (
+    id          BIGSERIAL PRIMARY KEY,
+    page        TEXT,
+    name        TEXT NOT NULL,
+    contact     TEXT NOT NULL,
+    task        TEXT,
+    site        TEXT,
+    note        TEXT,
+    source      TEXT,
+    ip          TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Учёт доставки уведомления. Заявка, о которой никто не узнал, хуже упавшего сервиса:
+-- сервис заметят, её — нет. Захват (claimed_at + claim_id) разводит первичную отправку
+-- и цикл дослыла, чтобы владелец не получил дубль и чтобы поздний ответ не пометил
+-- чужую попытку успешной.
+ALTER TABLE site_leads ADD COLUMN IF NOT EXISTS notified_at       TIMESTAMPTZ;
+ALTER TABLE site_leads ADD COLUMN IF NOT EXISTS notify_claimed_at TIMESTAMPTZ;
+ALTER TABLE site_leads ADD COLUMN IF NOT EXISTS notify_attempts   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE site_leads ADD COLUMN IF NOT EXISTS notify_claim_id   UUID;
+CREATE INDEX IF NOT EXISTS idx_site_leads_time ON site_leads(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_site_leads_pending
+    ON site_leads(notify_claimed_at) WHERE notified_at IS NULL;
+-- gen_random_uuid() с PostgreSQL 13 входит в ядро, расширение не нужно. Проверка на случай
+-- отката на более старую версию: без неё первая же заявка упала бы на INSERT.
+DO $$
+BEGIN
+    PERFORM gen_random_uuid();
+EXCEPTION WHEN undefined_function THEN
+    RAISE EXCEPTION 'gen_random_uuid() недоступна: нужен PostgreSQL 13+ либо CREATE EXTENSION pgcrypto';
+END $$;
