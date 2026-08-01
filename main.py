@@ -138,7 +138,8 @@ _PRIME_CIRCUS_INTERESTS = {
     "nikulin": "Цирк Никулина, купол 38 м",
 }
 
-_WIDGET_EVENTS = {"widget_loaded", "widget_opened", "consent_given", "message_sent", "lead_created"}
+_WIDGET_EVENTS = {"widget_loaded", "widget_opened", "question_started", "consent_shown",
+                  "consent_given", "message_sent", "lead_created"}
 
 
 def _client_ref_allowed(client: str, referrer: str) -> bool:
@@ -214,6 +215,21 @@ def _mask_messages(messages: list) -> tuple[list, dict]:
         for m in messages
     ]
     return masked, mapping
+
+
+# Ответ-заглушка, когда контакт пришёл до согласия: LLM не вызываем (в истории вместо
+# контакта уже плейсхолдер), человеку объясняем один следующий шаг.
+_CONSENT_REQUIRED_REPLY = (
+    "Готов передать вашу заявку менеджеру ПРАЙМ-ТЕНТ. Для этого нужно согласие на "
+    "обработку контактных данных — отметьте, пожалуйста, галочку под чатом и отправьте "
+    "контакт ещё раз, я сразу всё оформлю."
+)
+# Помощник просит контакт → сигнал фронту показать блок согласия (consent_shown).
+_CONTACT_REQUEST_RE = re.compile(
+    r"(подскажите|оставьте|укажите|напишите|пришлите)[^.!?\n]{0,80}"
+    r"(телефон|контакт|почт|номер|e-?mail)",
+    re.I,
+)
 
 
 def _extract_contact_local(text: str) -> dict:
@@ -1959,6 +1975,9 @@ CLIENTS = {
         "lead_email": ["tent@prime-tent.ru"],
         "lead_label": "ПРАЙМ-ТЕНТ",
         "kind": "prime-tent",
+        # Мягкое согласие: вопросы без галочки, согласие только перед передачей контакта.
+        # Контакт, пришедший до согласия, сервер не сохраняет в полном виде и не превращает в лид.
+        "deferred_consent": True,
     },
     # Собственные каналы студии — только для лейбла уведомления (chat идёт своими промптами).
     "demo": {
@@ -2355,7 +2374,8 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
                 session_id,
             )
             sess = await conn.fetchrow(
-                "SELECT has_lead, lead_notified, referrer, interest FROM sessions WHERE session_id=$1",
+                """SELECT has_lead, lead_notified, referrer, interest, consent_at
+                   FROM sessions WHERE session_id=$1""",
                 session_id,
             )
         if not rows:
@@ -2364,6 +2384,11 @@ async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> No
         # Контакт извлекаем ЛОКАЛЬНО (в Claude ПД не уходят)
         local = _extract_contact_local(transcript)
         has_lead_new = local["has_lead"]
+        # Вторая линия обороны согласия: без consent_at контакт не становится лидом и не
+        # уходит в Telegram/почту/Метрику (первая линия — /chat маскирует его ещё до БД).
+        if cfg.get("deferred_consent") and not (sess and sess["consent_at"]):
+            local = {"name": None, "contact": None, "has_lead": False}
+            has_lead_new = False
         # Нишу/тариф/интент — из Claude по ОБЕЗЛИЧЕННОМУ транскрипту
         emap: dict = {}
         masked_transcript = _mask_pii(transcript, emap)
@@ -2601,6 +2626,21 @@ async def widget_event(request: Request):
                    VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING""",
                 client, session_id, event, page[:200],
             )
+            if event == "consent_given":
+                # Согласие фиксируем и на сессии: /chat может прийти раньше события
+                # (гонка), COALESCE оставляет самый ранний момент и первую версию политики.
+                policy_version = str(body.get("policy_version") or "").strip()[:32]
+                await conn.execute(
+                    """INSERT INTO sessions (session_id, referrer)
+                       VALUES ($1, $2) ON CONFLICT (session_id) DO NOTHING""",
+                    session_id, page[:500],
+                )
+                await conn.execute(
+                    """UPDATE sessions SET consent_at=COALESCE(consent_at, NOW()),
+                           consent_policy_version=COALESCE(consent_policy_version, NULLIF($2,''))
+                       WHERE session_id=$1""",
+                    session_id, policy_version,
+                )
     except Exception as e:
         print(f"[widget-events] failed: {type(e).__name__}")
         return JSONResponse({"ok": False}, status_code=503)
@@ -2723,6 +2763,14 @@ async def chat(request: Request):
         return JSONResponse({"error": "last message must be from user"}, status_code=400)
     user_text = str(messages[-1].get("content", ""))[:8000]
 
+    # Мягкое согласие: галочка в /chat приходит клеймом consent_policy — версия политики,
+    # под которой пользователь её отметил. Отдельного события ждать нельзя (гонка: согласие
+    # и удержанное сообщение уходят одновременно).
+    deferred_consent = bool(client_cfg.get("deferred_consent"))
+    consent_policy = str(body.get("consent_policy") or "").strip()[:32]
+    has_consent = False
+    consent_gate = False
+
     server_messages: list = []
     if pool:
         try:
@@ -2738,18 +2786,62 @@ async def chat(request: Request):
                     session_id, user_agent, referrer[:500], ip[:64], interest,
                     yclid, ym_client_id,
                 )
-                rows = await conn.fetch(
-                    """SELECT role, content FROM messages
-                       WHERE session_id=$1 ORDER BY created_at DESC LIMIT 40""",
-                    session_id,
-                )
-                await conn.execute(
-                    "INSERT INTO messages (session_id, role, content) VALUES ($1, 'user', $2)",
-                    session_id, user_text,
-                )
-            server_messages = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+                if deferred_consent and consent_policy:
+                    await conn.execute(
+                        """UPDATE sessions SET consent_at=COALESCE(consent_at, NOW()),
+                               consent_policy_version=COALESCE(consent_policy_version, NULLIF($2,''))
+                           WHERE session_id=$1""",
+                        session_id, consent_policy,
+                    )
+                if deferred_consent:
+                    has_consent = bool(await conn.fetchval(
+                        "SELECT consent_at FROM sessions WHERE session_id=$1", session_id,
+                    ))
+                if deferred_consent and not has_consent and _extract_contact_local(user_text)["has_lead"]:
+                    # Контакт до согласия: в БД и историю LLM уходит только маскированная
+                    # версия (mapping выбрасываем — полного значения не остаётся нигде),
+                    # лид не создаётся, LLM не вызывается.
+                    consent_gate = True
+                    redacted = _mask_pii(user_text, {})
+                    await conn.execute(
+                        "INSERT INTO messages (session_id, role, content) VALUES ($1, 'user', $2)",
+                        session_id, redacted[:8000],
+                    )
+                    await conn.execute(
+                        "INSERT INTO messages (session_id, role, content) VALUES ($1, 'assistant', $2)",
+                        session_id, _CONSENT_REQUIRED_REPLY,
+                    )
+                    await conn.execute(
+                        """UPDATE sessions SET contact_before_consent=TRUE,
+                               msg_count=msg_count+2, last_activity_at=NOW()
+                           WHERE session_id=$1""",
+                        session_id,
+                    )
+                    await conn.execute(
+                        """INSERT INTO widget_events(client, session_id, event_name, page)
+                           VALUES($1,$2,'consent_shown',$3) ON CONFLICT DO NOTHING""",
+                        client_name, session_id, (referrer or "")[:200],
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """SELECT role, content FROM messages
+                           WHERE session_id=$1 ORDER BY created_at DESC LIMIT 40""",
+                        session_id,
+                    )
+                    await conn.execute(
+                        "INSERT INTO messages (session_id, role, content) VALUES ($1, 'user', $2)",
+                        session_id, user_text,
+                    )
+                    server_messages = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
         except Exception as e:
             print(f"[chat] db history/log failed: {e}")
+    elif deferred_consent and _extract_contact_local(user_text)["has_lead"]:
+        # Без БД согласие проверить нечем — контакт не принимаем (fail-safe).
+        consent_gate = True
+
+    if consent_gate:
+        return JSONResponse({"reply": _CONSENT_REQUIRED_REPLY, "session_id": session_id,
+                             "consent_required": True})
 
     server_messages.append({"role": "user", "content": user_text})
     server_messages = _normalize_history(server_messages)
@@ -2892,6 +2984,7 @@ async def chat(request: Request):
                 if (
                     PT_LEAD_GOAL_ENABLED
                     and client_cfg.get("kind") == "prime-tent"
+                    and (not deferred_consent or has_consent)
                     and _extract_contact_local(user_text)["has_lead"]
                 ):
                     lead_signal = bool(
@@ -2910,6 +3003,20 @@ async def chat(request: Request):
     payload = {"reply": reply, "usage": usage, "session_id": session_id}
     if lead_signal:
         payload["lead"] = True
+    # Помощник попросил контакт — фронт показывает блок согласия ровно в этот момент.
+    # Событие пишет сервер (не фронт): определение намерения — здесь, PK дедуплицирует.
+    if deferred_consent and not has_consent and _CONTACT_REQUEST_RE.search(reply):
+        payload["show_consent"] = True
+        if pool:
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO widget_events(client, session_id, event_name, page)
+                           VALUES($1,$2,'consent_shown',$3) ON CONFLICT DO NOTHING""",
+                        client_name, session_id, (referrer or "")[:200],
+                    )
+            except Exception:
+                pass
     return JSONResponse(payload)
 
 

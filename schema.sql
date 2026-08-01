@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS widget_events (
     client TEXT NOT NULL,
     session_id TEXT NOT NULL,
     event_name TEXT NOT NULL CHECK (event_name IN
-      ('widget_loaded','widget_opened','consent_given','message_sent','lead_created')),
+      ('widget_loaded','widget_opened','question_started','consent_shown',
+       'consent_given','message_sent','lead_created')),
     page TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (client, session_id, event_name)
@@ -157,3 +158,17 @@ BEGIN
 EXCEPTION WHEN undefined_function THEN
     RAISE EXCEPTION 'gen_random_uuid() недоступна: нужен PostgreSQL 13+ либо CREATE EXTENSION pgcrypto';
 END $$;
+
+-- ─────────────── Мягкое согласие prime-tent (01.08.2026) ───────────────
+-- Вопрос можно задать без галочки; согласие требуется только для передачи контакта.
+-- Юридическая граница — на сервере: контакт, пришедший до согласия, хранится только
+-- в замаскированном виде (contact_before_consent фиксирует сам факт).
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS consent_policy_version TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS contact_before_consent BOOLEAN NOT NULL DEFAULT FALSE;
+-- Существующие БД: расширить список событий воронки (имя констрейнта — автогенерация Postgres
+-- для inline CHECK; на свежих БД CREATE TABLE выше уже содержит полный список).
+ALTER TABLE widget_events DROP CONSTRAINT IF EXISTS widget_events_event_name_check;
+ALTER TABLE widget_events ADD CONSTRAINT widget_events_event_name_check CHECK (event_name IN
+  ('widget_loaded','widget_opened','question_started','consent_shown',
+   'consent_given','message_sent','lead_created'));

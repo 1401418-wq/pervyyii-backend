@@ -50,11 +50,14 @@
   .typing span:nth-child(3) { animation-delay: 0.4s; }
   @keyframes bounce { 0%,80%,100% { opacity: 0.3; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-4px); } }
 
+  /* Скрыт по умолчанию: согласие спрашиваем только перед передачей контакта,
+     свободные вопросы галочки не требуют */
   .consent {
-    display: flex; align-items: flex-start; gap: 8px;
+    display: none; align-items: flex-start; gap: 8px;
     padding: 10px 16px; background: #eaf0f6; border-top: 1px solid rgba(3,26,46,0.08);
     font-size: 12px; color: #4a6379; line-height: 1.4; flex: none;
   }
+  .consent.visible { display: flex; }
   .consent input { margin-top: 2px; width: 15px; height: 15px; flex: none; accent-color: #12385c; cursor: pointer; }
   .consent label { cursor: pointer; flex: 1; min-width: 0; }
   .consent a { color: #12385c; }
@@ -103,14 +106,14 @@
   <div class="message bot">Здравствуйте! Я ИИ-помощник компании ПРАЙМ-ТЕНТ. Готов немедленно помочь Вам в выборе нашей продукции, ответить на все вопросы по ней и сделать предварительный расчёт интересующего Вас тентового сооружения.</div>
 </div>
 
-<div class="consent">
+<div class="consent" id="consent-block">
   <input type="checkbox" id="consent">
-  <label for="consent">Соглашаюсь с обработкой персональных данных согласно <a href="https://prime-tent.ru/privacy.html" target="_blank" rel="noopener">Политике</a></label>
+  <label for="consent">Чтобы передать заявку в ПРАЙМ-ТЕНТ, подтвердите согласие на обработку контактных данных — <a href="https://prime-tent.ru/privacy.html" target="_blank" rel="noopener">Политика</a></label>
 </div>
 
 <div class="input-area">
-  <textarea id="input" placeholder="Напишите сообщение..." rows="1" autocomplete="off" disabled></textarea>
-  <button id="send" disabled>Отправить</button>
+  <textarea id="input" placeholder="Напишите сообщение..." rows="1" autocomplete="off"></textarea>
+  <button id="send">Отправить</button>
 </div>
 
 <div class="powered">
@@ -137,11 +140,12 @@
       : String(Date.now()) + Math.random().toString(16).slice(2));
     sessionStorage.setItem("pt_sid", sessionId);
   }
-  function trackEvent(name) {
+  function trackEvent(name, extra) {
     try {
+      var body = {client:"prime-tent", event:name, session_id:sessionId, page:referrer};
+      if (extra) for (var k in extra) body[k] = extra[k];
       fetch("widget-events", {method:"POST", headers:{"Content-Type":"application/json"},
-        keepalive:true, body:JSON.stringify({client:"prime-tent", event:name,
-          session_id:sessionId, page:referrer})}).catch(function(){});
+        keepalive:true, body:JSON.stringify(body)}).catch(function(){});
     } catch (_) {}
   }
   // Сигнал родительской странице для цели Яндекс.Метрики (ym живёт там, не в iframe)
@@ -180,9 +184,47 @@
     inputEl.disabled = !on;
     sendBtn.disabled = !on;
   }
+
+  // ─── Мягкое согласие: вопросы свободно, галочка — только перед передачей контакта ───
+  var POLICY_VERSION = "2026-08-01";
+  var consentBlock = document.getElementById("consent-block");
+  var consentGiven = sessionStorage.getItem("pt_consent") === "1";
+  var consentShownSent = false;
+  var questionStartedSent = false;
+  var consentHintShown = false;
+  var pendingResend = "";   // текст, который сервер отклонил до согласия (перепослать после галочки)
+  var heldFromInput = false; // отправку удержали из-за контакта: после галочки дослать из поля
+
+  // Зеркала серверных регулярок контакта (_PHONE_RE/_EMAIL_RE/_TG_RE в main.py):
+  // фронт ловит для UX, юридическая граница всё равно на сервере.
+  var PHONE_JS = /\+?[78]?[\s\-().]*\d(?:[\s\-().]*\d){9,10}/;
+  var EMAIL_JS = /[\w.+-]+@[\w-]+\.[\w.-]+/;
+  var TG_JS = /@[A-Za-z][A-Za-z0-9_]{3,}/;
+  function hasContact(text) {
+    return PHONE_JS.test(text) || EMAIL_JS.test(text) || TG_JS.test(text);
+  }
+
+  function showConsent() {
+    if (consentGiven) return;
+    consentBlock.classList.add("visible");
+    if (!consentShownSent) { consentShownSent = true; trackEvent("consent_shown"); }
+  }
+
   consentEl.addEventListener("change", function () {
-    setEnabled(consentEl.checked);
-    if (consentEl.checked) { trackEvent("consent_given"); inputEl.focus(); }
+    if (!consentEl.checked) return;
+    consentGiven = true;
+    sessionStorage.setItem("pt_consent", "1");
+    trackEvent("consent_given", {policy_version: POLICY_VERSION});
+    // Автоотправка только удержанного: галочка посреди набора текста слать не должна.
+    if (heldFromInput && inputEl.value.trim()) {
+      heldFromInput = false;
+      send();
+    } else if (pendingResend) {
+      var text = pendingResend; pendingResend = "";
+      send(text, true);
+    } else {
+      inputEl.focus();
+    }
   });
 
   function addMessage(text, who) {
@@ -208,17 +250,31 @@
   }
   function hideTyping() { const t = document.getElementById("typing"); if (t) t.remove(); }
 
-  async function send() {
-    if (!consentEl.checked) return;
-    const text = inputEl.value.trim();
+  async function send(forcedText, isResend) {
+    const text = (forcedText !== undefined ? forcedText : inputEl.value.trim());
     if (!text) return;
 
-    addMessage(text, "user");
+    // Контакт без согласия не отправляем: текст остаётся в поле, показываем галочку.
+    // Отметит — этот же send() уйдёт из обработчика чекбокса.
+    if (!consentGiven && !isResend && hasContact(text)) {
+      heldFromInput = true;
+      showConsent();
+      if (!consentHintShown) {
+        consentHintShown = true;
+        addMessage("Чтобы я передал ваш контакт менеджеру, подтвердите согласие на обработку контактных данных — галочка ниже.", "bot");
+      }
+      return;
+    }
+    heldFromInput = false;
+
+    if (!isResend) {
+      addMessage(text, "user");
+      inputEl.value = "";
+      inputEl.style.height = "auto";
+    }
     trackEvent("message_sent");
     notifyParentGoal("pt_assistant_message");
     history.push({ role: "user", content: text });
-    inputEl.value = "";
-    inputEl.style.height = "auto";
     setEnabled(false);
     showTyping();
 
@@ -233,7 +289,8 @@
           referrer: referrer,
           interest: interest,
           yclid: ptYclid,
-          ym_client_id: ptClientId
+          ym_client_id: ptClientId,
+          consent_policy: consentGiven ? POLICY_VERSION : ""
         })
       });
       const data = await res.json();
@@ -248,6 +305,15 @@
       } else {
         addMessage("Извините, что-то пошло не так. Попробуйте позже или свяжитесь с нами напрямую.", "bot");
       }
+      // Серверная страховка сработала: контакт ушёл до согласия (фронтовый детектор
+      // его не поймал). Ответ-заглушка уже показан, после галочки перепосылаем текст.
+      if (data.consent_required) {
+        pendingResend = text;
+        showConsent();
+      } else if (data.show_consent) {
+        // Помощник попросил контакт — заранее показываем галочку, ввод не блокируем.
+        showConsent();
+      }
     } catch (e) {
       hideTyping();
       addMessage("Нет связи. Проверьте интернет и попробуйте снова.", "bot");
@@ -257,10 +323,14 @@
     }
   }
 
-  sendBtn.addEventListener("click", send);
+  sendBtn.addEventListener("click", function () { send(); });
   inputEl.addEventListener("input", function () {
     inputEl.style.height = "auto";
     inputEl.style.height = Math.min(inputEl.scrollHeight, 130) + "px";
+    if (!questionStartedSent && inputEl.value.trim()) {
+      questionStartedSent = true;
+      trackEvent("question_started");
+    }
   });
   inputEl.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
