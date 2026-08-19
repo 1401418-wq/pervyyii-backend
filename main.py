@@ -3751,10 +3751,19 @@ async def _site_lead_retention_loop() -> None:
                         "WHERE created_at < NOW() - ($1::text || ' days')::interval",
                         str(BRIEF_RETENTION_DAYS),
                     )
+                    # Копия заявки брифа в site_leads наследует НЕ общий трёхлетний срок,
+                    # а обещанные брифу 90 дней — иначе обещание о хранении ложно.
+                    brief_leads_result = await conn.execute(
+                        "DELETE FROM site_leads WHERE source = 'brief' "
+                        "AND created_at < NOW() - ($1::text || ' days')::interval",
+                        str(BRIEF_RETENTION_DAYS),
+                    )
                 if result != "DELETE 0":
                     print(f"[lead] retention: {result}", flush=True)
                 if briefs_result != "DELETE 0":
                     print(f"[brief] retention: {briefs_result}", flush=True)
+                if brief_leads_result != "DELETE 0":
+                    print(f"[brief] site_leads retention: {brief_leads_result}", flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3870,6 +3879,8 @@ async def lead(request: Request):
 # Публичной регистрации нет — токены выдаются руками через админ-эндпоинты.
 # Полные ответы живут только в БД; в Telegram уходит карточка решения без свободных текстов.
 
+import html as html_mod
+
 BRIEF_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 BRIEF_POLICY_VERSION = "2026-08-19"
 BRIEF_RETENTION_DAYS = 90
@@ -3891,6 +3902,32 @@ BRIEF_CHOICE_KEYS = {
     "main_task", "result", "avg_check", "conversion", "start_when",
     "budget_stage", "budget_ads", "contact_channel", "contact_how",
     "agent_volume", "agent_offer",
+}
+
+# Допустимые значения выборов. Клиентский JS — не граница доверия: прямой запрос
+# с выдуманными значениями не должен попадать ни в БД, ни в карточку решения.
+_BRIEF_TASKS = {
+    "sales_start", "more_leads", "cheaper_leads", "new_site", "redo_site",
+    "cant_reply", "night_lost", "want_agent", "diagnose", "dont_know",
+}
+BRIEF_VALID = {
+    "main_task": _BRIEF_TASKS,
+    "tasks": _BRIEF_TASKS,
+    "result": {"why_few", "launch_ads", "per_month", "cheaper", "new_site", "improve_site", "stop_losing", "other"},
+    "avg_check": {"10k", "10_50", "50_200", "200_1m", "1m_plus", "no_sales", "dont_know"},
+    "conversion": {"1_2", "3_5", "6_plus", "no_leads", "dont_know"},
+    "start_when": {"asap", "month", "1_2m", "later"},
+    "budget_stage": {"10k", "10_30", "30_50", "50_100", "100_plus", "dont_know"},
+    "budget_ads": {"30k", "30_60", "60_100", "100_plus", "calc"},
+    "contact_channel": {"tg", "wa", "phone", "email"},
+    "contact_how": {"write", "call"},
+    "agent_volume": {"to5", "5_20", "20_50", "50_plus", "no_count"},
+    "agent_offer": {"interested", "add", "no"},
+    "channels": {"referrals", "direct", "search", "maps", "social", "avito", "other", "none"},
+    "site_actions": {"call", "form", "messenger", "buy", "other"},
+    "site_features": {"catalog", "payment", "account", "calculator", "crm", "none", "dont_know"},
+    "site_assets": {"photos", "reviews", "cases", "price", "nothing"},
+    "agent_channels": {"site", "tg", "wa", "phone", "avito", "other"},
 }
 
 BRIEF_LABELS = {
@@ -3939,7 +3976,7 @@ BRIEF_LABELS = {
 
 
 def _brief_clean(payload: dict) -> dict:
-    """Оставляет только известные ключи, режет длину. Незнакомое молча выбрасывает."""
+    """Оставляет только известные ключи и значения, режет длину. Незнакомое молча выбрасывает."""
     out: dict = {}
     for key, limit in BRIEF_STR_KEYS.items():
         val = payload.get(key)
@@ -3948,18 +3985,51 @@ def _brief_clean(payload: dict) -> dict:
     for key, max_items in BRIEF_LIST_KEYS.items():
         val = payload.get(key)
         if isinstance(val, list):
-            items = [str(x)[:40] for x in val if isinstance(x, (str, int))][:max_items]
+            valid = BRIEF_VALID[key]
+            items: list = []
+            for x in val:
+                if isinstance(x, str) and x in valid and x not in items:
+                    items.append(x)
+            items = items[:max_items]
+            # «Пока ниоткуда» взаимоисключающе с остальными каналами.
+            if key == "channels" and "none" in items:
+                items = ["none"]
             if items:
                 out[key] = items
     for key in BRIEF_CHOICE_KEYS:
         val = payload.get(key)
-        if isinstance(val, str) and val.strip():
-            out[key] = val.strip()[:40]
+        if isinstance(val, str) and val in BRIEF_VALID[key]:
+            out[key] = val
+    # Главная задача обязана быть одной из выбранных.
+    if out.get("main_task") and out.get("tasks") and out["main_task"] not in out["tasks"]:
+        out.pop("main_task")
     return out
 
 
-async def _brief_row(token: str):
-    if not (pool and BRIEF_TOKEN_RE.match(token or "")):
+def _brief_submit_missing(a: dict) -> list:
+    """Проверка обязательной части перед отправкой. Возвращает список недостающих полей."""
+    ads_group = {"sales_start", "more_leads", "cheaper_leads"}
+    agent_group = {"cant_reply", "night_lost", "want_agent"}
+    required = ["tasks", "main_task", "business", "channels", "result",
+                "avg_check", "start_when", "budget_stage", "contact_name",
+                "contact_value", "contact_channel"]
+    missing = [k for k in required if not a.get(k)]
+    main = a.get("main_task")
+    if main in ads_group | agent_group and not a.get("conversion"):
+        missing.append("conversion")
+    if main in ads_group and not a.get("budget_ads"):
+        missing.append("budget_ads")
+    return missing
+
+
+def _brief_token(request: Request) -> str | None:
+    """Токен приходит ТОЛЬКО в заголовке: пути и query попадают в access-логи, заголовки — нет."""
+    token = request.headers.get("x-brief-token", "")
+    return token if BRIEF_TOKEN_RE.match(token) else None
+
+
+async def _brief_row(token: str | None):
+    if not (pool and token):
         return None
     async with pool.acquire() as conn:
         return await conn.fetchrow(
@@ -3985,6 +4055,11 @@ async def _brief_read_body(request: Request):
 
 def _brief_label(key: str, value) -> str:
     return BRIEF_LABELS.get(key, {}).get(value, str(value or "—"))
+
+
+def _brief_esc(value) -> str:
+    """Клиентские строки идут в Telegram-HTML — экранируем всегда."""
+    return html_mod.escape(str(value), quote=False)
 
 
 def _brief_card(row) -> str:
@@ -4033,11 +4108,11 @@ def _brief_card(row) -> str:
     if not questions:
         questions.append("уточнить сроки и следующий шаг")
 
-    contact = f'{_brief_label("contact_channel", a.get("contact_channel"))}: {a.get("contact_value", "—")}'
+    contact = f'{_brief_label("contact_channel", a.get("contact_channel"))}: {_brief_esc(a.get("contact_value", "—"))}'
     lines = [
-        f"🧾 <b>Бриф заполнен: {row['client_name'] or a.get('contact_name', '—')}</b>",
+        f"🧾 <b>Бриф заполнен: {_brief_esc(row['client_name'] or a.get('contact_name', '—'))}</b>",
         f"Задача: {_brief_label('main_task', main)}",
-        f"Бизнес: {business or '—'}",
+        f"Бизнес: {_brief_esc(business or '—')}",
         f"Каналы сейчас: {', '.join(_brief_label('channels', c) for c in a.get('channels', [])) or '—'}",
         f"Результат: {_brief_label('result', a.get('result'))}",
         f"Чек: {_brief_label('avg_check', a.get('avg_check'))} · Из 10 обращений: {_brief_label('conversion', a.get('conversion'))}",
@@ -4049,16 +4124,17 @@ def _brief_card(row) -> str:
     if flags:
         lines.append("⚠️ " + "; ".join(flags))
     lines.append("Спросить: " + "; ".join(questions[:5]))
-    lines.append(f"Полный бриф: https://pervyyii.ru/api/hub/brief/admin/view/{row['token']}")
+    # Ссылка по id, не по токену: токен — клиентский секрет, ему нечего делать в чате и логах.
+    lines.append(f"Полный бриф: https://pervyyii.ru/api/hub/brief/admin/view/{row['id']}")
     return "\n".join(lines)
 
 
-@app.get("/brief/{token}")
-async def brief_get(token: str, request: Request):
+@app.get("/brief/load")
+async def brief_get(request: Request):
     ip = _client_ip(request)
     if _rate_limited(f"brief:{ip}", limit=60, window=3600):
         return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
-    row = await _brief_row(token)
+    row = await _brief_row(_brief_token(request))
     if not row:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({
@@ -4067,38 +4143,43 @@ async def brief_get(token: str, request: Request):
         "answers": dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"]),
         "details": dict(row["details"]) if isinstance(row["details"], dict) else json.loads(row["details"]),
         "submitted": row["submitted_at"] is not None,
-    })
+    }, headers={"Cache-Control": "no-store"})
 
 
-@app.post("/brief/{token}/save")
-async def brief_save(token: str, request: Request):
+@app.post("/brief/save")
+async def brief_save(request: Request):
     ip = _client_ip(request)
     if _rate_limited(f"brief-save:{ip}", limit=120, window=3600):
         return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
     body = await _brief_read_body(request)
     if body is None:
         return JSONResponse({"error": "invalid body"}, status_code=400)
-    row = await _brief_row(token)
+    row = await _brief_row(_brief_token(request))
     if not row:
         return JSONResponse({"error": "not found"}, status_code=404)
     cleaned = _brief_clean(body.get("answers") or {})
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE briefs SET answers = answers || $2::jsonb, updated_at = NOW() WHERE id = $1",
+        # После отправки основная часть заморожена: карточка решения и согласие
+        # относятся к отправленной версии, менять её задним числом нельзя.
+        res = await conn.execute(
+            "UPDATE briefs SET answers = answers || $2::jsonb, updated_at = NOW()"
+            " WHERE id = $1 AND submitted_at IS NULL AND revoked_at IS NULL",
             row["id"], json.dumps(cleaned, ensure_ascii=False),
         )
+    if res.endswith(" 0"):
+        return JSONResponse({"error": "already submitted"}, status_code=409)
     return JSONResponse({"ok": True})
 
 
-@app.post("/brief/{token}/submit")
-async def brief_submit(token: str, request: Request):
+@app.post("/brief/submit")
+async def brief_submit(request: Request):
     ip = _client_ip(request)
     if _rate_limited(f"brief-submit:{ip}", limit=10, window=3600):
         return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
     body = await _brief_read_body(request)
     if body is None:
         return JSONResponse({"error": "invalid body"}, status_code=400)
-    row = await _brief_row(token)
+    row = await _brief_row(_brief_token(request))
     if not row:
         return JSONResponse({"error": "not found"}, status_code=404)
     if row["submitted_at"] is not None:
@@ -4106,28 +4187,36 @@ async def brief_submit(token: str, request: Request):
     if body.get("consent") is not True:
         return JSONResponse({"error": "Нужно согласие на обработку данных"}, status_code=400)
     cleaned = _brief_clean(body.get("answers") or {})
-    if not cleaned.get("contact_value") or not cleaned.get("contact_name"):
-        return JSONResponse({"error": "Укажите имя и контакт"}, status_code=400)
+    merged = dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"])
+    merged.update(cleaned)
+    missing = _brief_submit_missing(merged)
+    if missing:
+        return JSONResponse({"error": "Заполните обязательные вопросы", "fields": missing}, status_code=422)
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "UPDATE briefs SET answers = answers || $2::jsonb, consent_at = NOW(),"
-            " policy_version = $3, submitted_at = NOW(), updated_at = NOW()"
-            " WHERE id = $1 RETURNING *",
-            row["id"], json.dumps(cleaned, ensure_ascii=False), BRIEF_POLICY_VERSION,
-        )
-        # Дублируем факт заявки в site_leads: весь контур уведомлений (дослыл, напоминания)
-        # уже живёт там, и бриф получает его бесплатно. Свободные тексты не копируем.
-        a = dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"])
-        lead_row = await conn.fetchrow(
-            "INSERT INTO site_leads (page, name, contact, task, site, note, source, ip,"
-            " notify_claimed_at, notify_attempts, notify_claim_id)"
-            " VALUES ('brief', $1, $2, $3, $4, $5, $6, $7, NOW(), 1, gen_random_uuid())"
-            " RETURNING id, notify_claim_id",
-            a.get("contact_name", ""), a.get("contact_value", ""),
-            _brief_label("main_task", a.get("main_task"))[:120],
-            a.get("site_url", "")[:200], f"бриф #{row['id']}", "brief", ip,
-        )
+        async with conn.transaction():
+            # Атомарный захват: параллельный submit или отзыв токена между чтением
+            # и записью не создадут вторую отправку и вторую заявку.
+            row = await conn.fetchrow(
+                "UPDATE briefs SET answers = answers || $2::jsonb, consent_at = NOW(),"
+                " policy_version = $3, submitted_at = NOW(), updated_at = NOW()"
+                " WHERE id = $1 AND submitted_at IS NULL AND revoked_at IS NULL RETURNING *",
+                row["id"], json.dumps(cleaned, ensure_ascii=False), BRIEF_POLICY_VERSION,
+            )
+            if row is None:
+                return JSONResponse({"ok": True, "already": True})
+            # Дублируем факт заявки в site_leads: весь контур уведомлений (дослыл, напоминания)
+            # уже живёт там, и бриф получает его бесплатно. Свободные тексты не копируем.
+            a = dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"])
+            lead_row = await conn.fetchrow(
+                "INSERT INTO site_leads (page, name, contact, task, site, note, source, ip,"
+                " notify_claimed_at, notify_attempts, notify_claim_id)"
+                " VALUES ('brief', $1, $2, $3, $4, $5, $6, $7, NOW(), 1, gen_random_uuid())"
+                " RETURNING id, notify_claim_id",
+                a.get("contact_name", ""), a.get("contact_value", ""),
+                _brief_label("main_task", a.get("main_task"))[:120],
+                a.get("site_url", "")[:200], f"бриф #{row['id']}", "brief", ip,
+            )
     notified = await _lead_notify(_brief_card(row))
     if notified:
         try:
@@ -4144,25 +4233,33 @@ async def brief_submit(token: str, request: Request):
     return JSONResponse({"ok": True})
 
 
-@app.post("/brief/{token}/details")
-async def brief_details(token: str, request: Request):
+@app.post("/brief/details")
+async def brief_details(request: Request):
     ip = _client_ip(request)
     if _rate_limited(f"brief-save:{ip}", limit=120, window=3600):
         return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
     body = await _brief_read_body(request)
     if body is None:
         return JSONResponse({"error": "invalid body"}, status_code=400)
-    row = await _brief_row(token)
+    row = await _brief_row(_brief_token(request))
     if not row or row["submitted_at"] is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     cleaned = _brief_clean(body.get("details") or {})
-    first_time = row["details_at"] is None and bool(cleaned)
+    first_time = False
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE briefs SET details = details || $2::jsonb, details_at = NOW(), updated_at = NOW()"
-            " WHERE id = $1",
+        res = await conn.execute(
+            "UPDATE briefs SET details = details || $2::jsonb, updated_at = NOW()"
+            " WHERE id = $1 AND submitted_at IS NOT NULL AND revoked_at IS NULL",
             row["id"], json.dumps(cleaned, ensure_ascii=False),
         )
+        if res.endswith(" 0"):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if cleaned:
+            # Атомарный захват «первых деталей»: два параллельных запроса дадут одно уведомление.
+            first_time = await conn.fetchval(
+                "UPDATE briefs SET details_at = NOW() WHERE id = $1 AND details_at IS NULL RETURNING id",
+                row["id"],
+            ) is not None
     if first_time:
         extra = ""
         offer = cleaned.get("agent_offer")
@@ -4171,8 +4268,8 @@ async def brief_details(token: str, request: Request):
             if cleaned.get("faq"):
                 extra += ", частые вопросы клиентов приложил"
         await _lead_notify(
-            f"🧾 Бриф #{row['id']} ({row['client_name'] or 'клиент'}): добавлены детали.{extra}"
-            f"\nПолный бриф: https://pervyyii.ru/api/hub/brief/admin/view/{row['token']}"
+            f"🧾 Бриф #{row['id']} ({_brief_esc(row['client_name'] or 'клиент')}): добавлены детали.{extra}"
+            f"\nПолный бриф: https://pervyyii.ru/api/hub/brief/admin/view/{row['id']}"
         )
     return JSONResponse({"ok": True})
 
@@ -4227,13 +4324,13 @@ async def brief_admin_list(request: Request):
     return JSONResponse({"briefs": briefs})
 
 
-@app.get("/brief/admin/view/{token}", response_class=HTMLResponse)
-async def brief_admin_view(token: str, request: Request):
+@app.get("/brief/admin/view/{brief_id}", response_class=HTMLResponse)
+async def brief_admin_view(brief_id: int, request: Request):
     require_admin(request)
-    if not (pool and BRIEF_TOKEN_RE.match(token or "")):
+    if not pool:
         return HTMLResponse("<h1>not found</h1>", status_code=404)
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM briefs WHERE token = $1", token)
+        row = await conn.fetchrow("SELECT * FROM briefs WHERE id = $1", brief_id)
     if not row:
         return HTMLResponse("<h1>not found</h1>", status_code=404)
     answers = row["answers"] if isinstance(row["answers"], dict) else json.loads(row["answers"])
@@ -4263,7 +4360,7 @@ async def brief_admin_view(token: str, request: Request):
         + block("Основные ответы", answers)
         + block("Детали", details)
     )
-    return HTMLResponse(html)
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/")
