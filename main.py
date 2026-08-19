@@ -3746,8 +3746,15 @@ async def _site_lead_retention_loop() -> None:
                         "WHERE created_at < NOW() - ($1::text || ' days')::interval",
                         str(SITE_LEAD_RETENTION_DAYS),
                     )
+                    briefs_result = await conn.execute(
+                        "DELETE FROM briefs "
+                        "WHERE created_at < NOW() - ($1::text || ' days')::interval",
+                        str(BRIEF_RETENTION_DAYS),
+                    )
                 if result != "DELETE 0":
                     print(f"[lead] retention: {result}", flush=True)
+                if briefs_result != "DELETE 0":
+                    print(f"[brief] retention: {briefs_result}", flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3856,6 +3863,407 @@ async def lead(request: Request):
 
     print(f"[lead] id={lead_id} page={page} saved={saved} notified={notified}", flush=True)
     return JSONResponse({"ok": True})
+
+
+# ─────────────────── Онлайн-бриф ───────────────────
+# Персональная анкета для обратившихся клиентов: pervyyii.ru/brief/?k=<токен>.
+# Публичной регистрации нет — токены выдаются руками через админ-эндпоинты.
+# Полные ответы живут только в БД; в Telegram уходит карточка решения без свободных текстов.
+
+BRIEF_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+BRIEF_POLICY_VERSION = "2026-08-19"
+BRIEF_RETENTION_DAYS = 90
+BRIEF_MAX_BODY = 32 * 1024
+
+# Разрешённые ключи ответов. Всё вне списков отбрасывается молча: клиентский JS — не граница
+# доверия, границей служит этот whitelist и лимиты длины.
+BRIEF_STR_KEYS = {
+    "business": 1500, "site_url": 300, "goal_number": 20, "goal_other": 300,
+    "ads_spend": 200, "ads_leads": 200, "ads_landing": 300, "ads_geo": 300,
+    "faq": 2000, "tried": 1500, "who_answers": 500, "constraints": 1000,
+    "contact_name": 100, "contact_value": 200,
+}
+BRIEF_LIST_KEYS = {
+    "tasks": 10, "channels": 10, "site_actions": 6, "site_features": 8,
+    "site_assets": 6, "agent_channels": 6,
+}
+BRIEF_CHOICE_KEYS = {
+    "main_task", "result", "avg_check", "conversion", "start_when",
+    "budget_stage", "budget_ads", "contact_channel", "contact_how",
+    "agent_volume", "agent_offer",
+}
+
+BRIEF_LABELS = {
+    "main_task": {
+        "sales_start": "запустить первые продажи", "more_leads": "больше заявок",
+        "cheaper_leads": "снизить стоимость заявки", "new_site": "новый сайт",
+        "redo_site": "переделать сайт", "cant_reply": "не успевают отвечать",
+        "night_lost": "теряются вечерние обращения", "want_agent": "хочет ИИ-помощника",
+        "diagnose": "разобраться, что мешает", "dont_know": "не знает — нужна рекомендация",
+    },
+    "avg_check": {
+        "10k": "до 10 тыс.", "10_50": "10–50 тыс.", "50_200": "50–200 тыс.",
+        "200_1m": "200 тыс. – 1 млн", "1m_plus": "больше 1 млн",
+        "no_sales": "продаж не было", "dont_know": "не знает",
+    },
+    "conversion": {
+        "1_2": "1–2 из 10", "3_5": "3–5 из 10", "6_plus": "6+ из 10",
+        "no_leads": "обращений не было", "dont_know": "не знает",
+    },
+    "start_when": {
+        "asap": "как можно скорее", "month": "в течение месяца",
+        "1_2m": "через 1–2 месяца", "later": "позже, выбирает",
+    },
+    "budget_stage": {
+        "10k": "до 10 тыс.", "10_30": "10–30 тыс.", "30_50": "30–50 тыс.",
+        "50_100": "50–100 тыс.", "100_plus": "больше 100 тыс.", "dont_know": "просит варианты",
+    },
+    "budget_ads": {
+        "30k": "до 30 тыс./мес", "30_60": "30–60 тыс./мес", "60_100": "60–100 тыс./мес",
+        "100_plus": "больше 100 тыс./мес", "calc": "нужно рассчитать",
+    },
+    "contact_channel": {"tg": "Telegram", "wa": "WhatsApp", "phone": "телефон", "email": "почта"},
+    "contact_how": {"write": "написать", "call": "позвонить"},
+    "channels": {
+        "referrals": "сарафан", "direct": "Директ", "search": "поиск", "maps": "карты",
+        "social": "соцсети", "avito": "Авито/маркетплейсы", "other": "другое", "none": "пока ниоткуда",
+    },
+    "result": {
+        "why_few": "понять, почему мало заявок", "launch_ads": "запустить рекламу",
+        "per_month": "N обращений в месяц", "cheaper": "дешевле обращение",
+        "new_site": "новый сайт", "improve_site": "улучшить сайт",
+        "stop_losing": "перестать терять обращения", "other": "другое",
+    },
+    "agent_offer": {"interested": "интересно, ждёт цену", "add": "добавить в предложение", "no": "пока без него"},
+}
+
+
+def _brief_clean(payload: dict) -> dict:
+    """Оставляет только известные ключи, режет длину. Незнакомое молча выбрасывает."""
+    out: dict = {}
+    for key, limit in BRIEF_STR_KEYS.items():
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            out[key] = val.strip()[:limit]
+    for key, max_items in BRIEF_LIST_KEYS.items():
+        val = payload.get(key)
+        if isinstance(val, list):
+            items = [str(x)[:40] for x in val if isinstance(x, (str, int))][:max_items]
+            if items:
+                out[key] = items
+    for key in BRIEF_CHOICE_KEYS:
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            out[key] = val.strip()[:40]
+    return out
+
+
+async def _brief_row(token: str):
+    if not (pool and BRIEF_TOKEN_RE.match(token or "")):
+        return None
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM briefs WHERE token = $1 AND revoked_at IS NULL", token
+        )
+
+
+async def _brief_read_body(request: Request):
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > BRIEF_MAX_BODY:
+        return None
+    raw = b""
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > BRIEF_MAX_BODY:
+            return None
+    try:
+        body = json.loads(raw)
+        return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
+
+def _brief_label(key: str, value) -> str:
+    return BRIEF_LABELS.get(key, {}).get(value, str(value or "—"))
+
+
+def _brief_card(row) -> str:
+    """Карточка решения для Telegram: сводка, рекомендация, флаги, вопросы.
+
+    Свободные тексты клиента сюда не попадают (кроме обрезанной строки бизнеса) —
+    полный бриф смотрится по защищённой админ-ссылке.
+    """
+    a = dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"])
+    main = a.get("main_task") or (a.get("tasks") or [None])[0]
+    business = (a.get("business") or "")[:120]
+
+    site_group = {"new_site", "redo_site"}
+    ads_group = {"sales_start", "more_leads", "cheaper_leads"}
+    agent_group = {"cant_reply", "night_lost", "want_agent"}
+    if main in agent_group:
+        product = "ИИ-помощник"
+    elif main in site_group:
+        product = "сайт + ИИ-помощник" if a.get("agent_offer") in ("interested", "add") else "сайт или лендинг"
+    elif main in ads_group:
+        product = "настройка Директа + ведение"
+    else:
+        product = "аудит"
+
+    flags = []
+    if main in site_group and a.get("budget_stage") in ("10k", "10_30"):
+        flags.append("бюджет этапа ниже вилки лендинга — обсудить аудит или поэтапность")
+    elif main in site_group and a.get("budget_stage") == "30_50":
+        flags.append("бюджет в вилке лендинга, не сайта — уточнить объём")
+    if main in ads_group and a.get("budget_ads") == "30k":
+        flags.append("рекламный бюджет маленький — обсудить тестовый бюджет или начать с аудита")
+    if a.get("avg_check") in ("dont_know", "no_sales") and main in ads_group:
+        flags.append("экономика продажи неизвестна — посчитать на разговоре")
+    if a.get("channels") == ["none"] and main in ads_group:
+        flags.append("клиентов пока нет вообще — ожидания от рекламы проверить отдельно")
+
+    questions = []
+    if not a.get("site_url") and main not in agent_group:
+        questions.append("есть ли сайт или страница")
+    if a.get("conversion") == "dont_know":
+        questions.append("как считают обращения и продажи")
+    if a.get("agent_offer") in ("interested", "add") and not a.get("faq"):
+        questions.append("частые вопросы клиентов для базы помощника")
+    if a.get("budget_stage") == "dont_know":
+        questions.append("какой порядок бюджета обсуждаем")
+    if not questions:
+        questions.append("уточнить сроки и следующий шаг")
+
+    contact = f'{_brief_label("contact_channel", a.get("contact_channel"))}: {a.get("contact_value", "—")}'
+    lines = [
+        f"🧾 <b>Бриф заполнен: {row['client_name'] or a.get('contact_name', '—')}</b>",
+        f"Задача: {_brief_label('main_task', main)}",
+        f"Бизнес: {business or '—'}",
+        f"Каналы сейчас: {', '.join(_brief_label('channels', c) for c in a.get('channels', [])) or '—'}",
+        f"Результат: {_brief_label('result', a.get('result'))}",
+        f"Чек: {_brief_label('avg_check', a.get('avg_check'))} · Из 10 обращений: {_brief_label('conversion', a.get('conversion'))}",
+        f"Старт: {_brief_label('start_when', a.get('start_when'))} · Этап: {_brief_label('budget_stage', a.get('budget_stage'))}"
+        + (f" · Реклама: {_brief_label('budget_ads', a.get('budget_ads'))}" if a.get("budget_ads") else ""),
+        f"Связь: {contact} ({_brief_label('contact_how', a.get('contact_how'))})",
+        f"— Рекомендация: <b>{product}</b>",
+    ]
+    if flags:
+        lines.append("⚠️ " + "; ".join(flags))
+    lines.append("Спросить: " + "; ".join(questions[:5]))
+    lines.append(f"Полный бриф: https://pervyyii.ru/api/hub/brief/admin/view/{row['token']}")
+    return "\n".join(lines)
+
+
+@app.get("/brief/{token}")
+async def brief_get(token: str, request: Request):
+    ip = _client_ip(request)
+    if _rate_limited(f"brief:{ip}", limit=60, window=3600):
+        return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
+    row = await _brief_row(token)
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({
+        "ok": True,
+        "name": row["client_name"] or "",
+        "answers": dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"]),
+        "details": dict(row["details"]) if isinstance(row["details"], dict) else json.loads(row["details"]),
+        "submitted": row["submitted_at"] is not None,
+    })
+
+
+@app.post("/brief/{token}/save")
+async def brief_save(token: str, request: Request):
+    ip = _client_ip(request)
+    if _rate_limited(f"brief-save:{ip}", limit=120, window=3600):
+        return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
+    body = await _brief_read_body(request)
+    if body is None:
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    row = await _brief_row(token)
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    cleaned = _brief_clean(body.get("answers") or {})
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE briefs SET answers = answers || $2::jsonb, updated_at = NOW() WHERE id = $1",
+            row["id"], json.dumps(cleaned, ensure_ascii=False),
+        )
+    return JSONResponse({"ok": True})
+
+
+@app.post("/brief/{token}/submit")
+async def brief_submit(token: str, request: Request):
+    ip = _client_ip(request)
+    if _rate_limited(f"brief-submit:{ip}", limit=10, window=3600):
+        return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
+    body = await _brief_read_body(request)
+    if body is None:
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    row = await _brief_row(token)
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if row["submitted_at"] is not None:
+        return JSONResponse({"ok": True, "already": True})
+    if body.get("consent") is not True:
+        return JSONResponse({"error": "Нужно согласие на обработку данных"}, status_code=400)
+    cleaned = _brief_clean(body.get("answers") or {})
+    if not cleaned.get("contact_value") or not cleaned.get("contact_name"):
+        return JSONResponse({"error": "Укажите имя и контакт"}, status_code=400)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE briefs SET answers = answers || $2::jsonb, consent_at = NOW(),"
+            " policy_version = $3, submitted_at = NOW(), updated_at = NOW()"
+            " WHERE id = $1 RETURNING *",
+            row["id"], json.dumps(cleaned, ensure_ascii=False), BRIEF_POLICY_VERSION,
+        )
+        # Дублируем факт заявки в site_leads: весь контур уведомлений (дослыл, напоминания)
+        # уже живёт там, и бриф получает его бесплатно. Свободные тексты не копируем.
+        a = dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"])
+        lead_row = await conn.fetchrow(
+            "INSERT INTO site_leads (page, name, contact, task, site, note, source, ip,"
+            " notify_claimed_at, notify_attempts, notify_claim_id)"
+            " VALUES ('brief', $1, $2, $3, $4, $5, $6, $7, NOW(), 1, gen_random_uuid())"
+            " RETURNING id, notify_claim_id",
+            a.get("contact_name", ""), a.get("contact_value", ""),
+            _brief_label("main_task", a.get("main_task"))[:120],
+            a.get("site_url", "")[:200], f"бриф #{row['id']}", "brief", ip,
+        )
+    notified = await _lead_notify(_brief_card(row))
+    if notified:
+        try:
+            async with pool.acquire() as conn:
+                # Как в /lead: завершаем именно свою попытку, чтобы цикл дослыла не дублировал.
+                await conn.execute(
+                    "UPDATE site_leads SET notified_at = NOW()"
+                    " WHERE id = $1 AND notify_claim_id = $2 AND notified_at IS NULL",
+                    lead_row["id"], lead_row["notify_claim_id"],
+                )
+        except Exception as e:
+            print(f"[brief] mark notified failed: {_safe_err(e)}")
+    print(f"[brief] submit id={row['id']} notified={notified}", flush=True)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/brief/{token}/details")
+async def brief_details(token: str, request: Request):
+    ip = _client_ip(request)
+    if _rate_limited(f"brief-save:{ip}", limit=120, window=3600):
+        return JSONResponse({"error": "Слишком много запросов"}, status_code=429)
+    body = await _brief_read_body(request)
+    if body is None:
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    row = await _brief_row(token)
+    if not row or row["submitted_at"] is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    cleaned = _brief_clean(body.get("details") or {})
+    first_time = row["details_at"] is None and bool(cleaned)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE briefs SET details = details || $2::jsonb, details_at = NOW(), updated_at = NOW()"
+            " WHERE id = $1",
+            row["id"], json.dumps(cleaned, ensure_ascii=False),
+        )
+    if first_time:
+        extra = ""
+        offer = cleaned.get("agent_offer")
+        if offer in ("interested", "add"):
+            extra = f"\n➕ Клиент хочет ИИ-помощника ({_brief_label('agent_offer', offer)})"
+            if cleaned.get("faq"):
+                extra += ", частые вопросы клиентов приложил"
+        await _lead_notify(
+            f"🧾 Бриф #{row['id']} ({row['client_name'] or 'клиент'}): добавлены детали.{extra}"
+            f"\nПолный бриф: https://pervyyii.ru/api/hub/brief/admin/view/{row['token']}"
+        )
+    return JSONResponse({"ok": True})
+
+
+@app.post("/brief/admin/create")
+async def brief_admin_create(request: Request):
+    require_admin(request)
+    if not pool:
+        return JSONResponse({"error": "database not configured"}, status_code=503)
+    body = await _brief_read_body(request) or {}
+    name = (body.get("name") or "").strip()[:100]
+    note = (body.get("note") or "").strip()[:300]
+    token = secrets.token_urlsafe(18)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO briefs (token, client_name, note) VALUES ($1, $2, $3)",
+            token, name, note,
+        )
+    return JSONResponse({"ok": True, "url": f"https://pervyyii.ru/brief/?k={token}"})
+
+
+@app.post("/brief/admin/revoke")
+async def brief_admin_revoke(request: Request):
+    require_admin(request)
+    if not pool:
+        return JSONResponse({"error": "database not configured"}, status_code=503)
+    body = await _brief_read_body(request) or {}
+    token = (body.get("token") or "").strip()
+    if not BRIEF_TOKEN_RE.match(token):
+        return JSONResponse({"error": "bad token"}, status_code=400)
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE briefs SET revoked_at = NOW() WHERE token = $1 AND revoked_at IS NULL", token
+        )
+    return JSONResponse({"ok": True, "revoked": not res.endswith(" 0")})
+
+
+@app.get("/brief/admin/list")
+async def brief_admin_list(request: Request):
+    require_admin(request)
+    if not pool:
+        return JSONResponse({"error": "database not configured"}, status_code=503)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, token, client_name, note, created_at, submitted_at, details_at, revoked_at"
+            " FROM briefs ORDER BY created_at DESC LIMIT 200"
+        )
+    briefs = [
+        {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in dict(r).items()}
+        for r in rows
+    ]
+    return JSONResponse({"briefs": briefs})
+
+
+@app.get("/brief/admin/view/{token}", response_class=HTMLResponse)
+async def brief_admin_view(token: str, request: Request):
+    require_admin(request)
+    if not (pool and BRIEF_TOKEN_RE.match(token or "")):
+        return HTMLResponse("<h1>not found</h1>", status_code=404)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM briefs WHERE token = $1", token)
+    if not row:
+        return HTMLResponse("<h1>not found</h1>", status_code=404)
+    answers = row["answers"] if isinstance(row["answers"], dict) else json.loads(row["answers"])
+    details = row["details"] if isinstance(row["details"], dict) else json.loads(row["details"])
+
+    def esc(s) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def block(title: str, data: dict) -> str:
+        if not data:
+            return f"<h2>{title}</h2><p>—</p>"
+        rows_html = "".join(
+            f"<tr><td>{esc(k)}</td><td>{esc(', '.join(map(str, v)) if isinstance(v, list) else v)}</td></tr>"
+            for k, v in data.items()
+        )
+        return f"<h2>{title}</h2><table>{rows_html}</table>"
+
+    html = (
+        "<!doctype html><meta charset='utf-8'><meta name='robots' content='noindex,nofollow'>"
+        "<title>Бриф</title><style>body{font:15px/1.5 -apple-system,sans-serif;max-width:720px;"
+        "margin:2em auto;padding:0 1em}table{border-collapse:collapse;width:100%}"
+        "td{border:1px solid #ddd;padding:6px 10px;vertical-align:top}td:first-child{width:32%;color:#666}</style>"
+        f"<h1>Бриф #{row['id']} — {esc(row['client_name'] or '')}</h1>"
+        f"<p>Создан {row['created_at']:%d.%m.%Y %H:%M} · отправлен {row['submitted_at'] or '—'}"
+        f" · согласие {row['consent_at'] or '—'} (политика {esc(row['policy_version'] or '—')})"
+        f" · заметка: {esc(row['note'] or '—')}</p>"
+        + block("Основные ответы", answers)
+        + block("Детали", details)
+    )
+    return HTMLResponse(html)
 
 
 @app.get("/")

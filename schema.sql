@@ -172,3 +172,24 @@ ALTER TABLE widget_events DROP CONSTRAINT IF EXISTS widget_events_event_name_che
 ALTER TABLE widget_events ADD CONSTRAINT widget_events_event_name_check CHECK (event_name IN
   ('widget_loaded','widget_opened','question_started','consent_shown',
    'consent_given','message_sent','lead_created'));
+
+-- ─────────────── Онлайн-бриф (19.08.2026) ───────────────
+-- Персональная анкета для обратившихся клиентов. Токен выдаётся руками (админ-эндпоинт),
+-- публичной регистрации нет. Полные ответы живут только здесь; в Telegram уходит карточка
+-- решения без свободных текстов. Срок хранения — 90 дней (правило проекта по ПД).
+CREATE TABLE IF NOT EXISTS briefs (
+    id             BIGSERIAL PRIMARY KEY,
+    token          TEXT UNIQUE NOT NULL,
+    client_name    TEXT,
+    note           TEXT,
+    answers        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    details        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    consent_at     TIMESTAMPTZ,
+    policy_version TEXT,
+    submitted_at   TIMESTAMPTZ,
+    details_at     TIMESTAMPTZ,
+    revoked_at     TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_briefs_created ON briefs(created_at DESC);
