@@ -196,3 +196,24 @@ CREATE INDEX IF NOT EXISTS idx_briefs_created ON briefs(created_at DESC);
 -- Связь копии заявки с брифом: ретеншн копии считается от жизни брифа, не от submit.
 ALTER TABLE site_leads ADD COLUMN IF NOT EXISTS brief_id BIGINT;
 CREATE INDEX IF NOT EXISTS idx_site_leads_brief ON site_leads(brief_id) WHERE brief_id IS NOT NULL;
+
+-- ─────────────── Бриф: ступень 2 и открытый режим (19.08.2026) ───────────────
+-- stage 'intro' — короткая анкета-знакомство; 'work' — рабочий бриф по шаблону услуги
+-- (глубокий сбор материала для клиентов в работе). origin 'link' — персональная ссылка,
+-- 'open' — сессия с открытой страницы сайта (self-service, honeypot + лимиты в коде).
+ALTER TABLE briefs ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'intro';
+ALTER TABLE briefs ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'link';
+ALTER TABLE briefs ADD COLUMN IF NOT EXISTS template TEXT;
+-- ИИ-добавка нишевых вопросов, сгенерированных при создании ссылки: [{key,title,hint}].
+ALTER TABLE briefs ADD COLUMN IF NOT EXISTS extra_questions JSONB NOT NULL DEFAULT '[]'::jsonb;
+-- Ссылка на анкету-знакомство того же клиента: её ответы подставляются в рабочий бриф.
+ALTER TABLE briefs ADD COLUMN IF NOT EXISTS intro_brief_id BIGINT;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'briefs_stage_chk') THEN
+        ALTER TABLE briefs ADD CONSTRAINT briefs_stage_chk CHECK (stage IN ('intro', 'work'));
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'briefs_origin_chk') THEN
+        ALTER TABLE briefs ADD CONSTRAINT briefs_origin_chk CHECK (origin IN ('link', 'open'));
+    END IF;
+END $$;
