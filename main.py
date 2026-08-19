@@ -4082,15 +4082,24 @@ def _brief_work_questions(row) -> list:
     return questions
 
 
-def _brief_clean_work(payload: dict, questions: list) -> dict:
-    """Whitelist рабочего брифа: только ключи вопросов этой строки, только строки, с лимитом."""
+def _brief_clean_work(payload: dict, questions: list) -> tuple[dict, list]:
+    """Whitelist рабочего брифа: только ключи вопросов этой строки, только строки, с лимитом.
+
+    Возвращает (сохранить, удалить): явно присланная пустая строка — это стирание ранее
+    сохранённого ответа, и оно обязано доехать до БД. Иначе клиент видит вопрос пропущенным,
+    а стёртый текст продолжает жить в answers и уходить в карточку и админ-вид."""
     allowed = {q["key"] for q in questions}
     out: dict = {}
+    deleted: list = []
     for key in allowed:
         val = payload.get(key)
-        if isinstance(val, str) and val.strip():
+        if not isinstance(val, str):
+            continue
+        if val.strip():
             out[key] = val.strip()[:BRIEF_WORK_TEXT_LIMIT]
-    return out
+        else:
+            deleted.append(key)
+    return out, deleted
 
 
 def _brief_clean(payload: dict) -> dict:
@@ -4195,10 +4204,16 @@ def _brief_spawn(coro) -> None:
 
 async def _brief_llm(system: str, user: str, max_tokens: int, timeout: float) -> str | None:
     """Один вызов Claude для нужд брифа. Любая ошибка -> None: у всех вызовов есть
-    детерминированный запасной путь, падать из-за ИИ бриф не имеет права."""
+    детерминированный запасной путь, падать из-за ИИ бриф не имеет права.
+
+    Обезличивание — здесь, а не у вызывающих: свободные тексты анкеты могут содержать
+    телефоны, почты и реквизиты, и ни один будущий вызов не должен суметь забыть маску
+    (правило 152-ФЗ то же, что у ботов). Ответ не un-mask'аем: плейсхолдер в записке
+    безопаснее случайной утечки, реальные значения Женя видит в карточке и админ-виде."""
     if not ANTHROPIC_API_KEY:
         return None
     try:
+        masked_user = _mask_pii(user, {})
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 "https://api.anthropic.com/v1/messages",
@@ -4212,7 +4227,7 @@ async def _brief_llm(system: str, user: str, max_tokens: int, timeout: float) ->
                     "max_tokens": max_tokens,
                     "thinking": {"type": "disabled"},
                     "system": system,
-                    "messages": [{"role": "user", "content": user}],
+                    "messages": [{"role": "user", "content": masked_user}],
                 },
             )
         data = resp.json()
@@ -4424,17 +4439,18 @@ async def brief_save(request: Request):
     row = await _brief_row(_brief_token(request))
     if not row:
         return JSONResponse({"error": "not found"}, status_code=404)
+    deleted: list = []
     if row["stage"] == "work":
-        cleaned = _brief_clean_work(body.get("answers") or {}, _brief_work_questions(row))
+        cleaned, deleted = _brief_clean_work(body.get("answers") or {}, _brief_work_questions(row))
     else:
         cleaned = _brief_clean(body.get("answers") or {})
     async with pool.acquire() as conn:
         # После отправки основная часть заморожена: карточка решения и согласие
         # относятся к отправленной версии, менять её задним числом нельзя.
         res = await conn.execute(
-            "UPDATE briefs SET answers = answers || $2::jsonb, updated_at = NOW()"
+            "UPDATE briefs SET answers = (answers - $3::text[]) || $2::jsonb, updated_at = NOW()"
             " WHERE id = $1 AND submitted_at IS NULL AND revoked_at IS NULL",
-            row["id"], json.dumps(cleaned, ensure_ascii=False),
+            row["id"], json.dumps(cleaned, ensure_ascii=False), deleted,
         )
     if res.endswith(" 0"):
         return JSONResponse({"error": "already submitted"}, status_code=409)
@@ -4486,13 +4502,16 @@ async def brief_submit(request: Request):
     if body.get("consent") is not True:
         return JSONResponse({"error": "Нужно согласие на обработку данных"}, status_code=400)
     is_work = row["stage"] == "work"
+    deleted: list = []
     if is_work:
         questions = _brief_work_questions(row)
-        cleaned = _brief_clean_work(body.get("answers") or {}, questions)
+        cleaned, deleted = _brief_clean_work(body.get("answers") or {}, questions)
     else:
         cleaned = _brief_clean(body.get("answers") or {})
     merged = dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"])
     merged.update(cleaned)
+    for key in deleted:
+        merged.pop(key, None)
     if is_work:
         missing = [q["key"] for q in questions if q.get("req") and not merged.get(q["key"])]
     else:
@@ -4505,10 +4524,10 @@ async def brief_submit(request: Request):
             # Атомарный захват: параллельный submit или отзыв токена между чтением
             # и записью не создадут вторую отправку и вторую заявку.
             row = await conn.fetchrow(
-                "UPDATE briefs SET answers = answers || $2::jsonb, consent_at = NOW(),"
+                "UPDATE briefs SET answers = (answers - $4::text[]) || $2::jsonb, consent_at = NOW(),"
                 " policy_version = $3, submitted_at = NOW(), updated_at = NOW()"
                 " WHERE id = $1 AND submitted_at IS NULL AND revoked_at IS NULL RETURNING *",
-                row["id"], json.dumps(cleaned, ensure_ascii=False), BRIEF_POLICY_VERSION,
+                row["id"], json.dumps(cleaned, ensure_ascii=False), BRIEF_POLICY_VERSION, deleted,
             )
             if row is None:
                 return JSONResponse({"ok": True, "already": True})
@@ -4595,17 +4614,21 @@ async def brief_start(request: Request):
         return JSONResponse({"ok": True, "token": secrets.token_urlsafe(18)})
     token = secrets.token_urlsafe(18)
     async with pool.acquire() as conn:
-        # Дневной предохранитель: rate-limit по IP ботнет обходит, общий потолок — нет.
-        cnt = await conn.fetchval(
-            "SELECT COUNT(*) FROM briefs WHERE origin = 'open'"
-            " AND created_at > NOW() - INTERVAL '24 hours'"
-        )
-        if cnt >= BRIEF_OPEN_DAILY_CAP:
-            return JSONResponse({"error": "Попробуйте позже"}, status_code=429)
-        await conn.execute(
-            "INSERT INTO briefs (token, client_name, note, origin) VALUES ($1, '', '', 'open')",
-            token,
-        )
+        async with conn.transaction():
+            # Дневной предохранитель: rate-limit по IP ботнет обходит, общий потолок — нет.
+            # Advisory-лок сериализует проверку и вставку: без него пачка параллельных
+            # запросов видит один и тот же счётчик и потолок перестаёт быть потолком.
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext('brief-open-cap'))")
+            cnt = await conn.fetchval(
+                "SELECT COUNT(*) FROM briefs WHERE origin = 'open'"
+                " AND created_at > NOW() - INTERVAL '24 hours'"
+            )
+            if cnt >= BRIEF_OPEN_DAILY_CAP:
+                return JSONResponse({"error": "Попробуйте позже"}, status_code=429)
+            await conn.execute(
+                "INSERT INTO briefs (token, client_name, note, origin) VALUES ($1, '', '', 'open')",
+                token,
+            )
     return JSONResponse({"ok": True, "token": token}, headers={"Cache-Control": "no-store"})
 
 
