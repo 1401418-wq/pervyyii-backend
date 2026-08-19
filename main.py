@@ -3746,18 +3746,27 @@ async def _site_lead_retention_loop() -> None:
                         "WHERE created_at < NOW() - ($1::text || ' days')::interval",
                         str(SITE_LEAD_RETENTION_DAYS),
                     )
-                    briefs_result = await conn.execute(
-                        "DELETE FROM briefs "
-                        "WHERE created_at < NOW() - ($1::text || ' days')::interval",
-                        str(BRIEF_RETENTION_DAYS),
-                    )
-                    # Копия заявки брифа в site_leads наследует НЕ общий трёхлетний срок,
-                    # а обещанные брифу 90 дней — иначе обещание о хранении ложно.
-                    brief_leads_result = await conn.execute(
-                        "DELETE FROM site_leads WHERE source = 'brief' "
-                        "AND created_at < NOW() - ($1::text || ' days')::interval",
-                        str(BRIEF_RETENTION_DAYS),
-                    )
+                    # Копия заявки брифа наследует НЕ общий трёхлетний срок, а обещанные
+                    # брифу 90 дней, причём от создания САМОГО брифа — обе копии ПД
+                    # умирают одним моментом, в одной транзакции.
+                    async with conn.transaction():
+                        brief_leads_result = await conn.execute(
+                            "DELETE FROM site_leads sl USING briefs b "
+                            "WHERE sl.brief_id = b.id "
+                            "AND b.created_at < NOW() - ($1::text || ' days')::interval",
+                            str(BRIEF_RETENTION_DAYS),
+                        )
+                        # Страховка для строк без связи (не должно быть, но ПД важнее красоты).
+                        await conn.execute(
+                            "DELETE FROM site_leads WHERE source = 'brief' AND brief_id IS NULL "
+                            "AND created_at < NOW() - ($1::text || ' days')::interval",
+                            str(BRIEF_RETENTION_DAYS),
+                        )
+                        briefs_result = await conn.execute(
+                            "DELETE FROM briefs "
+                            "WHERE created_at < NOW() - ($1::text || ' days')::interval",
+                            str(BRIEF_RETENTION_DAYS),
+                        )
                 if result != "DELETE 0":
                     print(f"[lead] retention: {result}", flush=True)
                 if briefs_result != "DELETE 0":
@@ -4003,6 +4012,9 @@ def _brief_clean(payload: dict) -> dict:
     # Главная задача обязана быть одной из выбранных.
     if out.get("main_task") and out.get("tasks") and out["main_task"] not in out["tasks"]:
         out.pop("main_task")
+    # На почту не звонят: межполевая нормализация вместо семантически странных сочетаний.
+    if out.get("contact_channel") == "email":
+        out["contact_how"] = "write"
     return out
 
 
@@ -4210,12 +4222,12 @@ async def brief_submit(request: Request):
             a = dict(row["answers"]) if isinstance(row["answers"], dict) else json.loads(row["answers"])
             lead_row = await conn.fetchrow(
                 "INSERT INTO site_leads (page, name, contact, task, site, note, source, ip,"
-                " notify_claimed_at, notify_attempts, notify_claim_id)"
-                " VALUES ('brief', $1, $2, $3, $4, $5, $6, $7, NOW(), 1, gen_random_uuid())"
+                " brief_id, notify_claimed_at, notify_attempts, notify_claim_id)"
+                " VALUES ('brief', $1, $2, $3, $4, $5, $6, $7, $8, NOW(), 1, gen_random_uuid())"
                 " RETURNING id, notify_claim_id",
                 a.get("contact_name", ""), a.get("contact_value", ""),
                 _brief_label("main_task", a.get("main_task"))[:120],
-                a.get("site_url", "")[:200], f"бриф #{row['id']}", "brief", ip,
+                a.get("site_url", "")[:200], f"бриф #{row['id']}", "brief", ip, row["id"],
             )
     notified = await _lead_notify(_brief_card(row))
     if notified:
@@ -4245,21 +4257,22 @@ async def brief_details(request: Request):
     if not row or row["submitted_at"] is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     cleaned = _brief_clean(body.get("details") or {})
-    first_time = False
+    if not cleaned:
+        return JSONResponse({"ok": True})
     async with pool.acquire() as conn:
-        res = await conn.execute(
-            "UPDATE briefs SET details = details || $2::jsonb, updated_at = NOW()"
-            " WHERE id = $1 AND submitted_at IS NOT NULL AND revoked_at IS NULL",
+        # Один атомарный UPDATE: merge деталей, захват «первого раза» и проверка revoke
+        # без промежутка между ними. details_at ставится единожды (COALESCE) тем же NOW(),
+        # что и updated_at, — их равенство и означает «это была первая запись деталей».
+        marker = await conn.fetchrow(
+            "UPDATE briefs SET details = details || $2::jsonb, updated_at = NOW(),"
+            " details_at = COALESCE(details_at, NOW())"
+            " WHERE id = $1 AND submitted_at IS NOT NULL AND revoked_at IS NULL"
+            " RETURNING (details_at = updated_at) AS first_time",
             row["id"], json.dumps(cleaned, ensure_ascii=False),
         )
-        if res.endswith(" 0"):
+        if marker is None:
             return JSONResponse({"error": "not found"}, status_code=404)
-        if cleaned:
-            # Атомарный захват «первых деталей»: два параллельных запроса дадут одно уведомление.
-            first_time = await conn.fetchval(
-                "UPDATE briefs SET details_at = NOW() WHERE id = $1 AND details_at IS NULL RETURNING id",
-                row["id"],
-            ) is not None
+    first_time = bool(marker["first_time"])
     if first_time:
         extra = ""
         offer = cleaned.get("agent_offer")

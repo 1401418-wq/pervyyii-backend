@@ -193,3 +193,6 @@ CREATE TABLE IF NOT EXISTS briefs (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_briefs_created ON briefs(created_at DESC);
+-- Связь копии заявки с брифом: ретеншн копии считается от жизни брифа, не от submit.
+ALTER TABLE site_leads ADD COLUMN IF NOT EXISTS brief_id BIGINT;
+CREATE INDEX IF NOT EXISTS idx_site_leads_brief ON site_leads(brief_id) WHERE brief_id IS NOT NULL;
