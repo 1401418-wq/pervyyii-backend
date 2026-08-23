@@ -2389,6 +2389,10 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
                     print(f"[offline-conv] {session_id}: Метрика не подтвердила загрузку: {up}")
             except Exception:
                 print(f"[offline-conv] {session_id}: тело ответа не разобрано: {r.text[:200]}")
+        else:
+            # Без тела ошибки причина невидима: 400 одинаково выглядит и при протухшем
+            # yclid, и при неверном формате, и при недопустимой дате конверсии.
+            print(f"[offline-conv] {session_id}: Метрика отказала: {r.text[:300]}")
         print(f"[offline-conv] {session_id}: {id_type} -> HTTP {r.status_code}, "
               f"состояние={state}, загрузка={uploading_id}")
         await _finish_offline_claim(session_id, claim_id, state, uploading_id)
