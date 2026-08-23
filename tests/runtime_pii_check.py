@@ -1,4 +1,4 @@
-import os, sys, json, asyncio
+import os, sys, json, asyncio, tempfile
 
 os.environ["ANTHROPIC_API_KEY"] = "test-key-not-real"
 os.environ["DATABASE_URL"] = ""          # без БД — приложение стартует, аналитика off
@@ -86,8 +86,13 @@ with TestClient(main.app) as client:
 out = [c for c in CAPTURED if "anthropic" in c["url"]]
 print(f"\n=== запросов к Anthropic перехвачено: {len(out)} ===")
 dump = json.dumps(out, ensure_ascii=False)
-open("/private/tmp/claude-501/-Users-first/dd7111b3-317a-4d99-bcdf-10d3b2b4f8dc/scratchpad/anthropic_dump.json", "w").write(
-    json.dumps(out, ensure_ascii=False, indent=1))
+# Каталог берём из окружения: путь к scratchpad конкретной сессии живёт недолго,
+# а захардкоженный превращал тест в падающий у всех, кроме одного запуска.
+dump_path = os.path.join(os.environ.get("PII_DUMP_DIR") or tempfile.gettempdir(),
+                         "anthropic_dump.json")
+with open(dump_path, "w") as f:
+    f.write(json.dumps(out, ensure_ascii=False, indent=1))
+print(f"  дамп исходящего: {dump_path}")
 
 print("\n=== ПОИСК ПД В ИСХОДЯЩЕМ JSON ===")
 bad = 0
@@ -98,3 +103,5 @@ for label, val in SECRETS.items():
 print("\n=== ключи/токены ===")
 print("  ключ в теле:", "УТЕЧКА" if "test-key-not-real" in dump else "чисто (ключ только в headers)")
 print(f"\nВЕРДИКТ: {'NO-GO, утечек ' + str(bad) if bad else 'GO — контрольные значения не найдены'}")
+# Ненулевой код возврата: без него провалившийся тест выглядел как успешный прогон.
+sys.exit(1 if bad else 0)
