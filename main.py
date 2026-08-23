@@ -2337,8 +2337,14 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
             )
         if not row:
             return
-        if row["yclid"]:
-            id_type, column, ident = "YCLID", "Yclid", row["yclid"]
+        # yclid Яндекса — целое число. В адрес может попасть чужая метка (23.08.2026
+        # нашлась заявка с буквенным «yclid»): Метрика отвергает такую строку целиком,
+        # и заявка с рабочим ClientID молотила бы в пустую до исчерпания попыток.
+        yclid = row["yclid"] if (row["yclid"] or "").isdigit() else None
+        if row["yclid"] and not yclid:
+            print(f"[offline-conv] {session_id}: yclid не числовой, беру ClientID")
+        if yclid:
+            id_type, column, ident = "YCLID", "Yclid", yclid
         elif row["ym_client_id"]:
             id_type, column, ident = "CLIENT_ID", "ClientId", row["ym_client_id"]
         else:
@@ -2360,15 +2366,25 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
         # Время берём по моменту подтверждения заявки, а не по началу сессии: человек
         # мог написать через сутки после визита, и старая метка исказила бы привязку.
         ts = int(_time.time())
-        csv = f"{column},Target,DateTime\n{ident},{PT_OFFLINE_CONV_TARGET},{ts}\n"
-        url = (f"https://api-metrika.yandex.net/management/v1/counter/"
-               f"{PT_METRIKA_COUNTER}/offline_conversions/upload?client_id_type={id_type}")
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                url,
-                headers={"Authorization": f"OAuth {METRIKA_OAUTH_TOKEN}"},
-                files={"file": ("conversions.csv", csv.encode("utf-8"), "text/csv")},
-            )
+
+        async def _upload(kind: str, col: str, value: str):
+            body = f"{col},Target,DateTime\n{value},{PT_OFFLINE_CONV_TARGET},{ts}\n"
+            url = (f"https://api-metrika.yandex.net/management/v1/counter/"
+                   f"{PT_METRIKA_COUNTER}/offline_conversions/upload?client_id_type={kind}")
+            async with httpx.AsyncClient(timeout=30) as client:
+                return await client.post(
+                    url,
+                    headers={"Authorization": f"OAuth {METRIKA_OAUTH_TOKEN}"},
+                    files={"file": ("conversions.csv", body.encode("utf-8"), "text/csv")},
+                )
+
+        r = await _upload(id_type, column, ident)
+        # Идентификатор, который Метрике не понравился, валит всю строку. Запасной ClientID
+        # пробуем сразу же: визит существует, и ждать следующего круга незачем.
+        if r.status_code == 400 and id_type == "YCLID" and row["ym_client_id"]:
+            print(f"[offline-conv] {session_id}: yclid отвергнут, пробую ClientID")
+            id_type, column, ident = "CLIENT_ID", "ClientId", row["ym_client_id"]
+            r = await _upload(id_type, column, ident)
         # HTTP 200 значит лишь «запрос принят к обработке»: успехом считаем только
         # подтверждённую загрузку в теле ответа. Отдельно ловим случай, когда файл
         # обработан, но визит не найден: повторять бессмысленно (задним числом визит
