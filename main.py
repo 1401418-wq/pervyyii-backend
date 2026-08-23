@@ -2464,6 +2464,11 @@ async def _finish_offline_claim(session_id: str, claim_id: str, state: str,
 
 OFFLINE_CONV_MAX_ATTEMPTS = 5
 _offline_conv_token_checked_at: float | None = None
+_offline_conv_last_ok: float | None = None
+# Цикл ходит раз в час; 3 часа тишины — уже не задержка, а остановка.
+OFFLINE_CONV_STALE_SEC = 3 * 3600
+# Проверка токена суточная, сутки плюс запас на дрейф расписания.
+OFFLINE_CONV_TOKEN_STALE_SEC = 26 * 3600
 OFFLINE_CONV_AUDIT_PERIOD = 3600
 OFFLINE_CONV_SETTLE = "30 minutes"
 
@@ -2680,7 +2685,7 @@ async def _offline_conv_token_check() -> None:
     токена и отвечает 400 вместо 403 — 29.07 это увело диагностику в сторону на полдня.
     """
     global _offline_conv_token_checked_at
-    now = _time.monotonic()
+    now = _time.time()
     if _offline_conv_token_checked_at and now - _offline_conv_token_checked_at < 86400:
         return
     _offline_conv_token_checked_at = now
@@ -2701,12 +2706,17 @@ async def _offline_conv_token_check() -> None:
 
 async def _offline_conv_audit_loop() -> None:
     """Раз в час: дожать застрявшее и сверить привязку по факту, а не по ответу на upload."""
+    global _offline_conv_last_ok
     while True:
         try:
             if pool and PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN:
                 await _offline_conv_token_check()
                 await _offline_conv_retry_stuck()
                 await _offline_conv_verify_linkage()
+                # Отметка живости ставится ТОЛЬКО после полного прохода. Признака
+                # «задача не done» мало: зависшая корутина остаётся живой на вид,
+                # и внешний сторож считал бы всё исправным сколь угодно долго.
+                _offline_conv_last_ok = _time.time()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -5133,19 +5143,67 @@ async def health():
     # Состояние дозора отдаём наружу: после отключения браузерной цели офлайн-конверсия
     # осталась единственным источником, и остановка её цикла должна быть видна сторожу,
     # а не только в логах.
-    audit = "off"
-    if PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN:
-        task = globals().get("_offline_conv_audit_task")
-        audit = "up" if (task and not task.done()) else "DOWN"
-    elif PT_OFFLINE_CONV_ENABLED:
-        audit = "DOWN"  # флаг включён, а токена нет — цикл не стартовал
-    return {"status": "ok", "db": "up" if pool else "down", "offline_conv_audit": audit}
+    audit, age, last_ok = _offline_conv_health()
+    return {
+        "status": "ok",
+        "db": "up" if pool else "down",
+        "offline_conv_audit": audit,
+        "offline_conv_audit_last_ok": last_ok,
+        "offline_conv_audit_age_sec": age,
+    }
+
+
+def _offline_conv_health() -> tuple[str, int | None, str | None]:
+    """Состояние дозора: статус, возраст последнего полного прохода, время этого прохода.
+
+    Живость меряем возрастом отметки, а не тем, что задача не завершилась: зависшая
+    корутина остаётся на вид работающей, и статус up врал бы бесконечно.
+    """
+    if not (PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN):
+        # Флаг включён без токена — цикл не стартовал, это поломка, а не «выключено».
+        return ("DOWN" if PT_OFFLINE_CONV_ENABLED else "off"), None, None
+    task = globals().get("_offline_conv_audit_task")
+    if not task or task.done():
+        return "DOWN", None, None
+    if _offline_conv_last_ok is None:
+        # Первый проход ещё не завершился: сразу после рестарта это норма.
+        return "starting", None, None
+    age = int(_time.time() - _offline_conv_last_ok)
+    stamp = _datetime.fromtimestamp(_offline_conv_last_ok).isoformat(timespec="seconds")
+    token_age = (_time.time() - _offline_conv_token_checked_at
+                 if _offline_conv_token_checked_at else None)
+    stale = age > OFFLINE_CONV_STALE_SEC or (
+        token_age is not None and token_age > OFFLINE_CONV_TOKEN_STALE_SEC)
+    return ("DOWN" if stale else "up"), age, stamp
 
 
 # Отдельно от /chat: тот пишет каждое обращение в sessions и messages, и сторож раз
 # в 15 минут засорил бы статистику фальшивыми диалогами. Здесь только факт, что ключ
 # жив и кредиты не кончились: 29.07 API отключили за нулевой баланс, и агенты молчали
 # полчаса, пока это не нашли руками.
+@app.get("/health/offline-conv")
+async def health_offline_conv(request: Request):
+    """Красный код для внешнего сторожа, когда дозор офлайн-конверсий встал.
+
+    Отдаём именно HTTP-статусом, а не полем в теле: agents-watch сверяет код ответа
+    и не разбирает JSON, зато умеет всё остальное — два провала подряд до алерта,
+    антиспам и аварийный путь в Telegram мимо упавшего прокси.
+    """
+    if request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    host = request.client.host if request.client else ""
+    if not (host.startswith("127.") or host.startswith("172.") or host == "::1"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    audit, age, last_ok = _offline_conv_health()
+    body = {"status": audit, "age_sec": age, "last_ok": last_ok}
+    # «off» — осознанно выключенная функция, сторожу краснеть не из-за чего.
+    # «starting» — процесс только поднялся, первый проход ещё идёт.
+    if audit in ("up", "off", "starting"):
+        return body
+    return JSONResponse({**body, "reason": "дозор офлайн-конверсий не отвечает"},
+                        status_code=503)
+
+
 @app.get("/health/llm")
 async def health_llm(request: Request):
     # Наружу не отдаём: nginx проксирует весь /api/hub/, и без этой проверки любой мог бы
