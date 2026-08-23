@@ -980,6 +980,7 @@ _email_retry_task: asyncio.Task | None = None
 _lead_reminder_task: asyncio.Task | None = None
 _lead_notify_task: asyncio.Task | None = None
 _site_lead_retention_task: asyncio.Task | None = None
+_offline_conv_audit_task: asyncio.Task | None = None
 LEAD_REMINDERS_ENABLED = os.environ.get("LEAD_REMINDERS_ENABLED", "0") == "1"
 SITE_LEAD_RETENTION_DAYS = int(os.environ.get("SITE_LEAD_RETENTION_DAYS", "1095"))
 
@@ -1041,6 +1042,7 @@ async def _start_polling() -> None:
 @app.on_event("startup")
 async def startup() -> None:
     global pool, _email_retry_task, _lead_reminder_task, _lead_notify_task, _site_lead_retention_task
+    global _offline_conv_audit_task
     if not DATABASE_URL:
         print("[startup] DATABASE_URL not set — analytics disabled")
         return
@@ -1052,6 +1054,8 @@ async def startup() -> None:
         _email_retry_task = asyncio.create_task(_prime_email_retry_loop())
         _lead_notify_task = asyncio.create_task(_lead_notify_retry_loop())
         _site_lead_retention_task = asyncio.create_task(_site_lead_retention_loop())
+        if PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN:
+            _offline_conv_audit_task = asyncio.create_task(_offline_conv_audit_loop())
         if LEAD_REMINDERS_ENABLED:
             _lead_reminder_task = asyncio.create_task(_prime_lead_reminder_loop())
         if TELEGRAM_POLLING:
@@ -1067,7 +1071,9 @@ async def startup() -> None:
 @app.on_event("shutdown")
 async def shutdown() -> None:
     global _email_retry_task, _lead_reminder_task, _lead_notify_task, _site_lead_retention_task
-    for task_name in ("_email_retry_task", "_lead_reminder_task", "_lead_notify_task", "_site_lead_retention_task"):
+    global _offline_conv_audit_task
+    for task_name in ("_email_retry_task", "_lead_reminder_task", "_lead_notify_task", "_site_lead_retention_task",
+                      "_offline_conv_audit_task"):
         task = globals().get(task_name)
         if task:
             task.cancel()
@@ -2368,9 +2374,11 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
         # обработан, но визит не найден: повторять бессмысленно (задним числом визит
         # не появится), это проблема атрибуции, а не доставки.
         state = "failed"
+        uploading_id = None
         if r.status_code == 200:
             try:
                 up = (r.json() or {}).get("uploading") or {}
+                uploading_id = str(up.get("id")) if up.get("id") else None
                 status = str(up.get("status", "")).upper()
                 if status in ("UPLOADED", "PROCESSED"):
                     state = "sent"
@@ -2381,14 +2389,16 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
                     print(f"[offline-conv] {session_id}: Метрика не подтвердила загрузку: {up}")
             except Exception:
                 print(f"[offline-conv] {session_id}: тело ответа не разобрано: {r.text[:200]}")
-        print(f"[offline-conv] {session_id}: {id_type} -> HTTP {r.status_code}, состояние={state}")
-        await _finish_offline_claim(session_id, claim_id, state)
+        print(f"[offline-conv] {session_id}: {id_type} -> HTTP {r.status_code}, "
+              f"состояние={state}, загрузка={uploading_id}")
+        await _finish_offline_claim(session_id, claim_id, state, uploading_id)
     except Exception as e:
         print(f"[offline-conv] {session_id}: не отправлено: {e}")
         await _finish_offline_claim(session_id, claim_id, "failed")
 
 
-async def _finish_offline_claim(session_id: str, claim_id: str, state: str) -> None:
+async def _finish_offline_claim(session_id: str, claim_id: str, state: str,
+                                uploading_id: str | None = None) -> None:
     """Закрывает ИМЕННО свою попытку: чужой claim (перехваченный по таймауту) не трогаем."""
     try:
         async with pool.acquire() as conn:
@@ -2396,14 +2406,151 @@ async def _finish_offline_claim(session_id: str, claim_id: str, state: str) -> N
                 """UPDATE sessions
                       SET offline_conv_state = $3,
                           offline_conv_sent_at = CASE WHEN $3 = 'sent' THEN NOW()
-                                                      ELSE offline_conv_sent_at END
+                                                      ELSE offline_conv_sent_at END,
+                          offline_conv_uploading_id = COALESCE($4, offline_conv_uploading_id),
+                          offline_conv_attempts = offline_conv_attempts + 1
                     WHERE session_id = $1
                       AND offline_conv_state = 'sending'
                       AND offline_conv_claim_id = $2""",
-                session_id, claim_id, state,
+                session_id, claim_id, state, uploading_id,
             )
     except Exception as e:
         print(f"[offline-conv] {session_id}: не удалось закрыть попытку: {e}")
+
+
+OFFLINE_CONV_MAX_ATTEMPTS = 5
+OFFLINE_CONV_AUDIT_PERIOD = 3600
+OFFLINE_CONV_SETTLE = "30 minutes"
+
+
+async def _offline_conv_fetch_uploadings() -> dict[str, dict]:
+    """Состояние загрузок глазами Метрики: id -> {статус, сколько строк привязано}.
+
+    Списки для yclid и ClientID лежат в РАЗНЫХ выборках: без параметра client_id_type
+    отдаётся только одна из них, и половина наших загрузок выглядела бы пропавшей.
+    """
+    out: dict[str, dict] = {}
+    url = (f"https://api-metrika.yandex.net/management/v1/counter/"
+           f"{PT_METRIKA_COUNTER}/offline_conversions/uploadings")
+    async with httpx.AsyncClient(timeout=30) as client:
+        for id_type in ("YCLID", "CLIENT_ID"):
+            r = await client.get(
+                url,
+                params={"client_id_type": id_type},
+                headers={"Authorization": f"OAuth {METRIKA_OAUTH_TOKEN}"},
+            )
+            if r.status_code != 200:
+                print(f"[offline-conv] список загрузок {id_type}: HTTP {r.status_code}")
+                continue
+            for up in (r.json() or {}).get("uploadings") or []:
+                out[str(up.get("id"))] = {
+                    "status": str(up.get("status", "")).upper(),
+                    "linked": up.get("linked_quantity"),
+                }
+    return out
+
+
+async def _offline_conv_verify_linkage() -> None:
+    """Досматривает, ЧЕМ кончилась загрузка: приняли ≠ привязали.
+
+    Метрика привязывает конверсию к визиту асинхронно, поэтому ответ на upload говорит
+    только о приёме файла. Реальный итог виден в списке загрузок часами позже: PROCESSED
+    с ненулевым linked_quantity — привязано, LINKAGE_FAILURE — визит не найден.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT session_id, offline_conv_uploading_id
+                  FROM sessions
+                 WHERE offline_conv_uploading_id IS NOT NULL
+                   AND offline_conv_state = 'sent'
+                   AND offline_conv_checked_at IS NULL
+                   AND offline_conv_sent_at < NOW() - INTERVAL '{OFFLINE_CONV_SETTLE}'
+                 LIMIT 200"""
+        )
+    if not rows:
+        return
+    known = await _offline_conv_fetch_uploadings()
+    for row in rows:
+        info = known.get(row["offline_conv_uploading_id"])
+        if not info or info["status"] in ("", "UPLOADED", "IN_PROGRESS"):
+            continue  # ещё в работе, вернёмся на следующем круге
+        linked = info["linked"]
+        if info["status"] == "PROCESSED" and linked is None:
+            continue  # обработка ещё идёт, счётчик привязок не проставлен
+        if info["status"] == "PROCESSED" and linked > 0:
+            state = "sent"
+        elif info["status"].startswith("LINKAGE_FAILURE") or (
+                info["status"] == "PROCESSED" and linked == 0):
+            state = "unlinked"
+        else:
+            print(f"[offline-conv] {row['session_id']}: неизвестный статус загрузки {info}")
+            continue
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE sessions
+                      SET offline_conv_state = $2, offline_conv_checked_at = NOW()
+                    WHERE session_id = $1 AND offline_conv_state = 'sent'""",
+                row["session_id"], state,
+            )
+        if state == "unlinked":
+            print(f"[offline-conv] {row['session_id']}: Метрика не нашла визит "
+                  f"(загрузка {row['offline_conv_uploading_id']})", flush=True)
+            # Шлём В НАШ чат, а не через alerts_send('prime-tent'): на тот источник
+            # подписан клиент, и техническое сообщение про Метрику ушло бы ему.
+            await _lead_notify(
+                "Техническое. Офлайн-конверсия не привязалась к визиту\n\n"
+                f"Клиент: Прайм-Тент\n"
+                f"Сессия: {row['session_id']}\n"
+                f"Загрузка в Метрике: {row['offline_conv_uploading_id']}\n"
+                "Заявка в базе есть, в отчётах Директа этой конверсии не будет."
+            )
+
+
+async def _offline_conv_retry_stuck() -> None:
+    """Дожимает конверсии, застрявшие в pending и failed.
+
+    Отправка живёт в фоновой задаче запроса: если процесс перезапустили в этот момент
+    или Метрика ответила ошибкой, строка оставалась лежать навсегда — заявка от 12.08.2026
+    провисела в failed одиннадцать дней, и никто бы не заметил.
+    """
+    async with pool.acquire() as conn:
+        # Метрика не принимает конверсии старше 21 дня. Такие строки повторять бессмысленно,
+        # но и оставлять в pending нельзя: они навсегда осели бы в сводке как «в работе».
+        expired = await conn.execute(
+            """UPDATE sessions SET offline_conv_state = 'expired'
+                WHERE has_lead = TRUE
+                  AND referrer LIKE 'prime-tent.ru/%'
+                  AND offline_conv_state IN ('pending', 'failed')
+                  AND created_at < NOW() - INTERVAL '20 days'"""
+        )
+        if not expired.endswith(" 0"):
+            print(f"[offline-conv] просрочено окно Метрики: {expired}", flush=True)
+        rows = await conn.fetch(
+            f"""SELECT session_id FROM sessions
+                 WHERE has_lead = TRUE
+                   AND referrer LIKE 'prime-tent.ru/%'
+                   AND offline_conv_state IN ('pending', 'failed')
+                   AND offline_conv_attempts < {OFFLINE_CONV_MAX_ATTEMPTS}
+                 ORDER BY created_at
+                 LIMIT 20"""
+        )
+    for row in rows:
+        print(f"[offline-conv] повтор отправки: {row['session_id']}", flush=True)
+        await send_offline_conversion(row["session_id"], "prime-tent")
+
+
+async def _offline_conv_audit_loop() -> None:
+    """Раз в час: дожать застрявшее и сверить привязку по факту, а не по ответу на upload."""
+    while True:
+        try:
+            if pool and PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN:
+                await _offline_conv_retry_stuck()
+                await _offline_conv_verify_linkage()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[offline-conv] дозор упал: {type(e).__name__}: {_safe_err(e)}")
+        await asyncio.sleep(OFFLINE_CONV_AUDIT_PERIOD)
 
 
 async def extract_metadata(session_id: str, client_name: str = "pervyyii") -> None:

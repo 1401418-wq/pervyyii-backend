@@ -113,16 +113,21 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_attempt_at TIMESTAMPT
 -- Метка конкретной попытки: без неё запрос, чей claim уже протух и перехвачен другим,
 -- на выходе затирал чужой успешный результат своей ошибкой.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_claim_id TEXT;
+-- Идентификатор загрузки в Метрике и отметка сверки. Без них состояние 'sent' означало
+-- лишь «файл принят»: привязку Метрика делает асинхронно, и LINKAGE_FAILURE появляется
+-- часами позже. Заявка 21.08.2026 висела у нас как отправленная, а к визиту не привязалась.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_uploading_id TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_checked_at TIMESTAMPTZ;
+-- Счётчик попыток: без него ретрай долбил бы вечно строку, которую Метрика не принимает.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_attempts INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_sessions_offline_pending
     ON sessions(created_at) WHERE has_lead = TRUE AND offline_conv_state <> 'sent';
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sessions_offline_conv_state_chk') THEN
-        ALTER TABLE sessions ADD CONSTRAINT sessions_offline_conv_state_chk
-            CHECK (offline_conv_state IN ('pending', 'sending', 'sent', 'failed',
-                                          'unattributed', 'unlinked'));
-    END IF;
-END $$;
+-- Пересоздаём безусловно: добавилось 'expired'. Прежний вариант с IF NOT EXISTS новый
+-- список значений на уже существующем констрейнте молча не применял бы.
+ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_offline_conv_state_chk;
+ALTER TABLE sessions ADD CONSTRAINT sessions_offline_conv_state_chk
+    CHECK (offline_conv_state IN ('pending', 'sending', 'sent', 'failed',
+                                  'unattributed', 'unlinked', 'expired'));
 
 -- ─────────────── Заявки с посадочных /sites/ и /direct/ (30.07.2026) ───────────────
 -- До этого форма никуда не отправлялась: открывала Telegram с готовым текстом, а слать
