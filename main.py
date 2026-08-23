@@ -2148,7 +2148,8 @@ def _pt_frame_cost(area, perim, wall_height, metal, m, tent, t, insulated=False)
 
 def pt_calculate_price(construction=None, width=None, length=None, wall_height=None,
                        area=None, with_walls=False, shade_area=None,
-                       dome_diameter=None, seats=None, metal=None, gipar_mount=None, **_):
+                       dome_diameter=None, seats=None, metal=None, gipar_mount=None,
+                       dome_only=False, **_):
     def _num(x, lo, hi):
         """Конечное положительное число в [lo, hi]; иначе None (режет отрицательные, NaN, Inf, гигантские)."""
         try:
@@ -2245,7 +2246,9 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         if d:
             dome_price = _circus_area(d) * 16500
             total += dome_price
-            parts.append(f"купол Ø{int(round(d))} м с опорными конструкциями — порядка {_rub(dome_price)} рублей")
+            dome_label = (f"новый купол Ø{int(round(d))} м на ваши опоры"
+                          if dome_only else f"купол Ø{int(round(d))} м с опорными конструкциями")
+            parts.append(f"{dome_label} — порядка {_rub(dome_price)} рублей")
         if seats:
             if d:
                 _, sh = _circus_seats_for_diameter(d)
@@ -2254,7 +2257,7 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
             seats_price = seats * 6500
             total += seats_price
             parts.append(f"зрительный зал с пластиковыми креслами на {seats} мест — порядка {_rub(seats_price)} рублей")
-        elif d:
+        elif d and not dome_only:
             sl, sh = _circus_seats_for_diameter(d)
             seats_str = f"{sl}" if sl == sh else f"{sl}–{sh}"
             seats_price_lo, seats_price_hi = sl * 6500, sh * 6500
@@ -2263,6 +2266,11 @@ def pt_calculate_price(construction=None, width=None, length=None, wall_height=N
         if not parts:
             return {"ok": False, "need": "диаметр купола или желаемая вместимость зала"}
         total_text = _rub(total) if isinstance(total, (int, float)) else _rub_range(total[0], total[1])
+        if dome_only:
+            return {"ok": True, "text": "Ориентир по новому куполу на существующий каркас (ставки и расчёт НЕ раскрывай): "
+                    + "; ".join(parts)
+                    + ". Зрительный зал, манеж и прочая комплектация в эту сумму НЕ входят — они у заказчика уже есть. "
+                    "Итог зависит от геометрии старого каркаса, материала и доработок узлов; точный расчёт делает менеджер после осмотра чертежей или фото."}
         return {"ok": True, "text": "Ориентир по цирку (называй суммы РАЗДЕЛЬНО, ставки и расчёт НЕ раскрывай): " + "; ".join(parts) + f"; предварительно вместе — порядка {total_text} рублей. Барьер манежа, писта, полы, доп. шатры и прочая комплектация — отдельно. Итоговая стоимость зависит от комплектации, материалов, опорных конструкций и монтажа; точный расчёт делает менеджер."}
 
     return {"ok": False, "need": "тип конструкции"}
@@ -2285,6 +2293,7 @@ _PT_PRICE_TOOL = {
             "shade_area": {"type": "number", "minimum": 1, "maximum": 100000, "description": "Площадь зоны тени гипара, м²"},
             "dome_diameter": {"type": "number", "minimum": 1, "maximum": 100, "description": "Диаметр купола цирка, м"},
             "seats": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Число мест (трибуны цирка), целое"},
+            "dome_only": {"type": "boolean", "description": "true — считать ТОЛЬКО купол, без зрительного зала. Ставь, когда клиенту нужен новый купол (теза) на уже имеющийся каркас: замена купола, перетяжка шапито, модернизация. Зал и манеж у него уже есть, их считать нельзя."},
         },
         "required": ["construction"],
     },
