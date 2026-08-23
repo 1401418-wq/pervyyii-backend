@@ -2534,14 +2534,16 @@ async def _offline_conv_retry_stuck() -> None:
     провисела в failed одиннадцать дней, и никто бы не заметил.
     """
     async with pool.acquire() as conn:
-        # Метрика не принимает конверсии старше 21 дня. Такие строки повторять бессмысленно,
-        # но и оставлять в pending нельзя: они навсегда осели бы в сводке как «в работе».
+        # Метрика не принимает конверсию, если от ВИЗИТА до загрузки прошёл 21 день.
+        # Считаем от last_activity_at, а не от created_at: человек мог вернуться в диалог
+        # через неделю после первого захода, и по дате создания сессии мы списали бы
+        # в expired заявку, которую Метрика ещё приняла бы. День оставлен запасом.
         expired = await conn.execute(
             """UPDATE sessions SET offline_conv_state = 'expired'
                 WHERE has_lead = TRUE
                   AND referrer LIKE 'prime-tent.ru/%'
                   AND offline_conv_state IN ('pending', 'failed')
-                  AND created_at < NOW() - INTERVAL '20 days'"""
+                  AND COALESCE(last_activity_at, created_at) < NOW() - INTERVAL '20 days'"""
         )
         if not expired.endswith(" 0"):
             print(f"[offline-conv] просрочено окно Метрики: {expired}", flush=True)
@@ -2960,7 +2962,14 @@ async def chat(request: Request):
     referrer = _sanitize_referrer(body.get("referrer") or "")
     # Идентификаторы рекламного клика: yclid не зависит от Метрики в браузере,
     # поэтому именно он вытягивает заявки от людей с блокировщиками.
-    yclid = re.sub(r"[^0-9A-Za-z_-]", "", str(body.get("yclid") or ""))[:64]
+    # Загрузчик кладёт в это поле и yclid (рекламный клик, всегда число), и ysclid —
+    # метку перехода ИЗ ПОИСКА Яндекса, буквенную. Смешивать нельзя: Метрика принимает
+    # офлайн-конверсию только по числовому yclid, буквенная метка валит загрузку целиком
+    # (400 invalid_uploading). Разводим по разным колонкам прямо при записи, чтобы не
+    # терять сам факт «человек пришёл из поиска».
+    click_id = re.sub(r"[^0-9A-Za-z_-]", "", str(body.get("yclid") or ""))[:64]
+    yclid = click_id if click_id.isdigit() else ""
+    ysclid = "" if click_id.isdigit() else click_id
     ym_client_id = re.sub(r"[^0-9]", "", str(body.get("ym_client_id") or ""))[:32]
     interest = str(body.get("interest") or "").strip().lower()[:40]
     if client_name != "prime-tent" or interest not in _PRIME_CIRCUS_INTERESTS:
@@ -2989,14 +2998,15 @@ async def chat(request: Request):
             async with pool.acquire() as conn:
                 await conn.execute(
                     """INSERT INTO sessions (session_id, user_agent, referrer, ip, interest,
-                                             yclid, ym_client_id)
-                       VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''))
+                                             yclid, ym_client_id, ysclid)
+                       VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), NULLIF($7,''), NULLIF($8,''))
                        ON CONFLICT (session_id) DO UPDATE SET last_activity_at=NOW(),
                          interest=COALESCE(NULLIF(EXCLUDED.interest,''), sessions.interest),
                          yclid=COALESCE(sessions.yclid, EXCLUDED.yclid),
-                         ym_client_id=COALESCE(sessions.ym_client_id, EXCLUDED.ym_client_id)""",
+                         ym_client_id=COALESCE(sessions.ym_client_id, EXCLUDED.ym_client_id),
+                         ysclid=COALESCE(sessions.ysclid, EXCLUDED.ysclid)""",
                     session_id, user_agent, referrer[:500], ip[:64], interest,
-                    yclid, ym_client_id,
+                    yclid, ym_client_id, ysclid,
                 )
                 if deferred_consent and consent_policy:
                     await conn.execute(
