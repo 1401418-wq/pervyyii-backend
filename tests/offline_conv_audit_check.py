@@ -94,9 +94,48 @@ async def main_test():
     check("алерт не ушёл клиентским каналом", all("Прайм-Тент" in n for n in NOTIFIES))
 
     ok = await orphan_checks(check) and ok
+    heartbeat_checks(check)
 
     print("\nИТОГ:", "всё сошлось" if ok else "ЕСТЬ ПРОВАЛЫ")
     return 0 if ok else 1
+
+
+def heartbeat_checks(check):
+    """Краснеет ли статус, когда цикл встал. Без этого сторож бесполезен."""
+    print("\n--- heartbeat дозора ---")
+    import time as t
+
+    class LiveTask:
+        def done(self):
+            return False
+
+    class DeadTask:
+        def done(self):
+            return True
+
+    main._offline_conv_audit_task = LiveTask()
+    main._offline_conv_token_checked_at = t.time()
+
+    main._offline_conv_last_ok = t.time()
+    check("свежий проход — up", main._offline_conv_health()[0] == "up")
+
+    main._offline_conv_last_ok = t.time() - 4 * 3600
+    status, age, _ = main._offline_conv_health()
+    check("проход 4 часа назад — DOWN", status == "DOWN")
+    check("возраст отдаётся наружу", age is not None and age > 3 * 3600)
+
+    main._offline_conv_last_ok = t.time()
+    main._offline_conv_token_checked_at = t.time() - 30 * 3600
+    check("просроченная проверка токена — DOWN", main._offline_conv_health()[0] == "DOWN")
+
+    main._offline_conv_token_checked_at = t.time()
+    main._offline_conv_audit_task = DeadTask()
+    check("задача завершилась — DOWN", main._offline_conv_health()[0] == "DOWN")
+
+    main._offline_conv_audit_task = LiveTask()
+    main._offline_conv_last_ok = None
+    check("первый проход ещё идёт — starting, не DOWN",
+          main._offline_conv_health()[0] == "starting")
 
 
 async def orphan_checks(check):
