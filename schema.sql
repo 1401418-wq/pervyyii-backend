@@ -124,6 +124,13 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_uploading_id TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_checked_at TIMESTAMPTZ;
 -- Счётчик попыток: без него ретрай долбил бы вечно строку, которую Метрика не принимает.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_attempts INTEGER NOT NULL DEFAULT 0;
+-- Время САМОЙ конверсии, зафиксированное один раз при первой попытке. Раньше в загрузку шёл
+-- момент отправки: у повтора он другой, значит повторная отправка (ответ Метрики потерялся,
+-- строка зависла в sending) давала вторую конверсию вместо дубликата, который можно отсеять.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_event_at TIMESTAMPTZ;
+-- Когда последний раз жаловались на эту строку: без метки часовой цикл слал бы алерт
+-- о застрявшей конверсии каждый час.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS offline_conv_alerted_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_sessions_offline_pending
     ON sessions(created_at) WHERE has_lead = TRUE AND offline_conv_state <> 'sent';
 -- Пересоздаём безусловно: добавилось 'expired'. Прежний вариант с IF NOT EXISTS новый

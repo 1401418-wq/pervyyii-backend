@@ -93,8 +93,72 @@ async def main_test():
     check("алерт помечен как технический", NOTIFIES and NOTIFIES[0].startswith("Техническое."))
     check("алерт не ушёл клиентским каналом", all("Прайм-Тент" in n for n in NOTIFIES))
 
+    ok = await orphan_checks(check) and ok
+
     print("\nИТОГ:", "всё сошлось" if ok else "ЕСТЬ ПРОВАЛЫ")
     return 0 if ok else 1
+
+
+async def orphan_checks(check):
+    """Подбор загрузки, о которой мы не узнали: ответ Метрики потерялся после приёма файла."""
+    from datetime import datetime, timedelta
+    print("\n--- подбор ничьей загрузки перед повтором ---")
+    event_at = datetime.fromisoformat("2026-08-23T12:00:00+03:00")
+
+    UPLOADINGS["YCLID"] = [
+        {"id": 2001, "status": "UPLOADED", "linked_quantity": None,
+         "create_time": "2026-08-23T12:00:30+03:00"},
+    ]
+    UPLOADINGS["CLIENT_ID"] = []
+
+    class Conn:
+        def __init__(self, taken):
+            self.taken = taken
+
+        async def fetch(self, q, *a):
+            return [{"offline_conv_uploading_id": t} for t in self.taken]
+
+    class Acq:
+        def __init__(self, taken):
+            self.taken = taken
+
+        async def __aenter__(self):
+            return Conn(self.taken)
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Pool:
+        def __init__(self, taken):
+            self.taken = taken
+
+        def acquire(self):
+            return Acq(self.taken)
+
+    main.pool = Pool([])
+    got = await main._offline_conv_find_orphan("YCLID", event_at)
+    check("ничья загрузка подобрана", got == "2001")
+
+    main.pool = Pool(["2001"])
+    got = await main._offline_conv_find_orphan("YCLID", event_at)
+    check("занятую другой сессией не берём", got is None)
+
+    main.pool = Pool([])
+    got = await main._offline_conv_find_orphan("CLIENT_ID", event_at)
+    check("чужой тип идентификатора не берём", got is None)
+
+    UPLOADINGS["YCLID"].append({"id": 2002, "status": "UPLOADED", "linked_quantity": None,
+                                "create_time": "2026-08-23T12:01:00+03:00"})
+    got = await main._offline_conv_find_orphan("YCLID", event_at)
+    check("при двух кандидатах не угадываем", got is None)
+
+    UPLOADINGS["YCLID"] = [
+        {"id": 2003, "status": "UPLOADED", "linked_quantity": None,
+         "create_time": "2026-08-23T11:00:00+03:00"},
+    ]
+    got = await main._offline_conv_find_orphan("YCLID", event_at)
+    check("загрузку старше конверсии не берём", got is None)
+    return True
 
 
 sys.exit(asyncio.run(main_test()))

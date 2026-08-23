@@ -71,6 +71,7 @@ PT_OFFLINE_CONV_TARGET = os.environ.get("PT_OFFLINE_CONV_TARGET", "pt_assistant_
 
 # ─────────────────── Лимиты и защита от абуза ───────────────────
 import time as _time
+from datetime import datetime as _datetime, timedelta as _timedelta
 
 _rate_buckets: dict[str, list[float]] = {}
 
@@ -1056,6 +1057,12 @@ async def startup() -> None:
         _site_lead_retention_task = asyncio.create_task(_site_lead_retention_loop())
         if PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN:
             _offline_conv_audit_task = asyncio.create_task(_offline_conv_audit_loop())
+            print("[startup] дозор офлайн-конверсий запущен")
+        elif PT_OFFLINE_CONV_ENABLED:
+            # Флаг включён, а токена нет: конверсии не уйдут, и без этой строки
+            # единственным следом была бы тишина в логах.
+            print("[startup] ВНИМАНИЕ: PT_OFFLINE_CONV_ENABLED=1, но METRIKA_OAUTH_TOKEN пуст —"
+                  " дозор не запущен, конверсии Прайм-Тента уходить не будут")
         if LEAD_REMINDERS_ENABLED:
             _lead_reminder_task = asyncio.create_task(_prime_lead_reminder_loop())
         if TELEGRAM_POLLING:
@@ -2327,12 +2334,14 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
             row = await conn.fetchrow(
                 """UPDATE sessions
                       SET offline_conv_state = 'sending', offline_conv_attempt_at = NOW(),
-                          offline_conv_claim_id = $2
+                          offline_conv_claim_id = $2,
+                          offline_conv_event_at = COALESCE(offline_conv_event_at, NOW())
                     WHERE session_id = $1 AND has_lead = TRUE
                       AND (offline_conv_state IN ('pending', 'failed')
                            OR (offline_conv_state = 'sending'
                                AND offline_conv_attempt_at < NOW() - INTERVAL '15 minutes'))
-                RETURNING yclid, ym_client_id""",
+                RETURNING yclid, ym_client_id, offline_conv_attempts,
+                          offline_conv_event_at""",
                 session_id, claim_id,
             )
         if not row:
@@ -2365,7 +2374,22 @@ async def send_offline_conversion(session_id: str, client_name: str) -> None:
 
         # Время берём по моменту подтверждения заявки, а не по началу сессии: человек
         # мог написать через сутки после визита, и старая метка исказила бы привязку.
-        ts = int(_time.time())
+        # Время конверсии фиксируется один раз при первом захвате и переживает повторы:
+        # тогда повторная отправка даёт ту же строку, а не вторую конверсию с новой датой.
+        # По смыслу это тоже вернее — конверсия случилась, когда человек оставил контакт.
+        event_at = row["offline_conv_event_at"]
+        ts = int(event_at.timestamp()) if event_at else int(_time.time())
+
+        # Повтор опасен тем, что прошлая попытка могла ДОЙТИ до Метрики, а ответ потеряться:
+        # строка осталась в sending, и через 15 минут мы отправили бы конверсию второй раз.
+        # Поэтому перед повтором ищем свою загрузку среди ничьих.
+        if row["offline_conv_attempts"]:
+            orphan = await _offline_conv_find_orphan(id_type, event_at)
+            if orphan:
+                print(f"[offline-conv] {session_id}: прошлая попытка всё-таки дошла, "
+                      f"подобрал загрузку {orphan}", flush=True)
+                await _finish_offline_claim(session_id, claim_id, "sent", orphan)
+                return
 
         async def _upload(kind: str, col: str, value: str):
             body = f"{col},Target,DateTime\n{value},{PT_OFFLINE_CONV_TARGET},{ts}\n"
@@ -2439,6 +2463,7 @@ async def _finish_offline_claim(session_id: str, claim_id: str, state: str,
 
 
 OFFLINE_CONV_MAX_ATTEMPTS = 5
+_offline_conv_token_checked_at: float | None = None
 OFFLINE_CONV_AUDIT_PERIOD = 3600
 OFFLINE_CONV_SETTLE = "30 minutes"
 
@@ -2466,8 +2491,49 @@ async def _offline_conv_fetch_uploadings() -> dict[str, dict]:
                 out[str(up.get("id"))] = {
                     "status": str(up.get("status", "")).upper(),
                     "linked": up.get("linked_quantity"),
+                    "type": id_type,
+                    "created": up.get("create_time"),
                 }
     return out
+
+
+async def _offline_conv_find_orphan(id_type: str, event_at) -> str | None:
+    """Ищет загрузку, которую мы, возможно, уже создали, но не узнали об этом.
+
+    Ответ Метрики может потеряться уже после того, как файл принят: строка остаётся
+    в sending, и повтор отправил бы ту же конверсию второй раз. Признак «наша»:
+    нужный тип идентификатора, создана не раньше момента конверсии, и её id не привязан
+    ни к одной сессии. Если кандидатов несколько — не гадаем, пусть лучше будет повтор
+    с тем же DateTime, чем чужая загрузка в нашей строке.
+    """
+    if not (pool and event_at):
+        return None
+    known = await _offline_conv_fetch_uploadings()
+    if not known:
+        return None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT offline_conv_uploading_id FROM sessions"
+            " WHERE offline_conv_uploading_id IS NOT NULL"
+        )
+    taken = {r["offline_conv_uploading_id"] for r in rows}
+    floor = event_at - _timedelta(minutes=5)
+    candidates = []
+    for uid, info in known.items():
+        if uid in taken or info.get("type") != id_type or not info.get("created"):
+            continue
+        try:
+            created = _datetime.fromisoformat(info["created"])
+        except ValueError:
+            continue
+        if created >= floor:
+            candidates.append(uid)
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        print(f"[offline-conv] ничьих загрузок {id_type} несколько ({len(candidates)}), "
+              f"не угадываю — отправлю повтор с тем же DateTime")
+    return None
 
 
 async def _offline_conv_verify_linkage() -> None:
@@ -2533,6 +2599,9 @@ async def _offline_conv_retry_stuck() -> None:
     или Метрика ответила ошибкой, строка оставалась лежать навсегда — заявка от 12.08.2026
     провисела в failed одиннадцать дней, и никто бы не заметил.
     """
+    # Хосты берём из общего списка клиента, а не из строки в SQL: у prime-tent их два
+    # (с www), и захардкоженный один тихо уводил бы часть заявок мимо дозора.
+    hosts = sorted(_CLIENT_REF_HOSTS.get("prime-tent") or {"prime-tent.ru"})
     async with pool.acquire() as conn:
         # Метрика не принимает конверсию, если от ВИЗИТА до загрузки прошёл 21 день.
         # Считаем от last_activity_at, а не от created_at: человек мог вернуться в диалог
@@ -2541,24 +2610,93 @@ async def _offline_conv_retry_stuck() -> None:
         expired = await conn.execute(
             """UPDATE sessions SET offline_conv_state = 'expired'
                 WHERE has_lead = TRUE
-                  AND referrer LIKE 'prime-tent.ru/%'
+                  AND split_part(referrer, '/', 1) = ANY($1::text[])
                   AND offline_conv_state IN ('pending', 'failed')
-                  AND COALESCE(last_activity_at, created_at) < NOW() - INTERVAL '20 days'"""
+                  AND COALESCE(last_activity_at, created_at) < NOW() - INTERVAL '20 days'""",
+            hosts,
         )
         if not expired.endswith(" 0"):
             print(f"[offline-conv] просрочено окно Метрики: {expired}", flush=True)
         rows = await conn.fetch(
             f"""SELECT session_id FROM sessions
                  WHERE has_lead = TRUE
-                   AND referrer LIKE 'prime-tent.ru/%'
+                   AND split_part(referrer, '/', 1) = ANY($1::text[])
                    AND offline_conv_state IN ('pending', 'failed')
                    AND offline_conv_attempts < {OFFLINE_CONV_MAX_ATTEMPTS}
                  ORDER BY created_at
-                 LIMIT 20"""
+                 LIMIT 20""",
+            hosts,
         )
     for row in rows:
         print(f"[offline-conv] повтор отправки: {row['session_id']}", flush=True)
         await send_offline_conversion(row["session_id"], "prime-tent")
+    await _offline_conv_watchdog(hosts)
+
+
+async def _offline_conv_watchdog(hosts: list[str]) -> None:
+    """Сторож на случай, когда серверный канал замолчал целиком.
+
+    После отключения браузерной цели (23.08.2026) офлайн-конверсия — единственный источник
+    цели «Заявка из помощника». Дозор выше замечает «отправили, но не привязалось», а вот
+    «перестали отправлять вообще» — протухший токен, сброшенный флаг, исчерпанные попытки —
+    не заметил бы никто: в логах была бы просто тишина. Жалуемся не чаще раза в сутки
+    на строку, иначе часовой цикл превратится в спам.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""UPDATE sessions SET offline_conv_alerted_at = NOW()
+                 WHERE session_id IN (
+                   SELECT session_id FROM sessions
+                    WHERE has_lead = TRUE
+                      AND split_part(referrer, '/', 1) = ANY($1::text[])
+                      AND offline_conv_state NOT IN ('sent', 'unattributed', 'expired', 'unlinked')
+                      AND created_at > NOW() - INTERVAL '20 days'
+                      AND created_at < NOW() - INTERVAL '3 hours'
+                      AND (offline_conv_alerted_at IS NULL
+                           OR offline_conv_alerted_at < NOW() - INTERVAL '24 hours')
+                    LIMIT 20
+                 )
+                 RETURNING session_id, offline_conv_state, offline_conv_attempts""",
+            hosts,
+        )
+    for row in rows:
+        ischerpano = row["offline_conv_attempts"] >= OFFLINE_CONV_MAX_ATTEMPTS
+        print(f"[offline-conv] СТОРОЖ: {row['session_id']} застряла в "
+              f"{row['offline_conv_state']}, попыток {row['offline_conv_attempts']}", flush=True)
+        await _lead_notify(
+            "Техническое. Заявка не дошла до Метрики\n\n"
+            f"Клиент: Прайм-Тент\n"
+            f"Сессия: {row['session_id']}\n"
+            f"Состояние: {row['offline_conv_state']}, попыток {row['offline_conv_attempts']}"
+            + ("\nПопытки исчерпаны, сама уже не уедет." if ischerpano else "")
+            + "\nБраузерная цель отключена 23.08, других источников у этой заявки нет."
+        )
+
+
+async def _offline_conv_token_check() -> None:
+    """Раз в сутки проверяет, жив ли токен Метрики.
+
+    Права проверяются простым GET: на POST с данными Метрика разбирает тело ДО проверки
+    токена и отвечает 400 вместо 403 — 29.07 это увело диагностику в сторону на полдня.
+    """
+    global _offline_conv_token_checked_at
+    now = _time.monotonic()
+    if _offline_conv_token_checked_at and now - _offline_conv_token_checked_at < 86400:
+        return
+    _offline_conv_token_checked_at = now
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get("https://api-metrika.yandex.net/management/v1/counters",
+                             headers={"Authorization": f"OAuth {METRIKA_OAUTH_TOKEN}"})
+    if r.status_code == 200:
+        print("[offline-conv] токен Метрики жив", flush=True)
+        return
+    print(f"[offline-conv] ТОКЕН МЕТРИКИ НЕ РАБОТАЕТ: HTTP {r.status_code}", flush=True)
+    await _lead_notify(
+        "Техническое. Токен Метрики не работает\n\n"
+        f"Ответ: HTTP {r.status_code}\n"
+        "Офлайн-конверсии Прайм-Тента не уходят, а браузерная цель отключена — "
+        "заявки в отчётах Директа сейчас не появляются вообще."
+    )
 
 
 async def _offline_conv_audit_loop() -> None:
@@ -2566,6 +2704,7 @@ async def _offline_conv_audit_loop() -> None:
     while True:
         try:
             if pool and PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN:
+                await _offline_conv_token_check()
                 await _offline_conv_retry_stuck()
                 await _offline_conv_verify_linkage()
         except asyncio.CancelledError:
@@ -4991,7 +5130,16 @@ async def root():
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return {"status": "ok", "db": "up" if pool else "down"}
+    # Состояние дозора отдаём наружу: после отключения браузерной цели офлайн-конверсия
+    # осталась единственным источником, и остановка её цикла должна быть видна сторожу,
+    # а не только в логах.
+    audit = "off"
+    if PT_OFFLINE_CONV_ENABLED and METRIKA_OAUTH_TOKEN:
+        task = globals().get("_offline_conv_audit_task")
+        audit = "up" if (task and not task.done()) else "DOWN"
+    elif PT_OFFLINE_CONV_ENABLED:
+        audit = "DOWN"  # флаг включён, а токена нет — цикл не стартовал
+    return {"status": "ok", "db": "up" if pool else "down", "offline_conv_audit": audit}
 
 
 # Отдельно от /chat: тот пишет каждое обращение в sessions и messages, и сторож раз
