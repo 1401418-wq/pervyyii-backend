@@ -1,0 +1,31 @@
+{
+  "flow": "pervyyii-chat",
+  "entry_point": "POST https://pervyyii.ru/api/hub/chat (client=pervyyii)",
+  "metrics": [
+    {
+      "id": "facts",
+      "label": "Факты",
+      "kind": "binary"
+    },
+    {
+      "id": "no_invention",
+      "label": "Без выдумок",
+      "kind": "binary"
+    },
+    {
+      "id": "format",
+      "label": "Формат",
+      "kind": "binary"
+    }
+  ],
+  "perf_fields": [
+    "latency_s",
+    "attempts",
+    "usage"
+  ],
+  "harness_paths": [
+    "run_eval.py",
+    "cases.json"
+  ],
+  "harness_sha": "373696b64c9beff6"
+}

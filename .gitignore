@@ -3,3 +3,11 @@ __pycache__/
 venv/
 .venv/
 .env
+
+# Эвал агента: кейсы и раннер держим в репо, результаты прогонов — нет.
+# Транскрипты и отчёт пересобираются прогоном, в истории только шумят.
+.claude/hillclimb/**/traces/
+.claude/hillclimb/**/results.jsonl
+.claude/hillclimb/**/errors.jsonl
+.claude/hillclimb/**/report.html
+.claude/hillclimb/**/trajectory/
